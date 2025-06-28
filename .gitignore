@@ -29,3 +29,6 @@ build/
 
 wandb/
 temp/
+
+# Custom
+/arc-prize-2025/

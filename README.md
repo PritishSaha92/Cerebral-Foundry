@@ -11,7 +11,7 @@ This project uses a Python virtual environment to manage dependencies.
 source venv/bin/activate
 
 # On Windows
-venv\Scriptsctivate
+venv\Scripts\activate
 ```
 
 ### Installed Packages
