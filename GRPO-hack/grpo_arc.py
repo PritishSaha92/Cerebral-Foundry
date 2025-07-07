@@ -12,7 +12,7 @@ from peft import LoraConfig
 from trl import GRPOConfig, GRPOTrainer
 
 from easy_dataset.easiest_arc_dataset import dataset, grid_to_string
-from claude import call_claude_api
+from llm_api import call_qwen_api
 
 wandb.init(project="grpo-arc")
 
@@ -96,21 +96,19 @@ def llm_feedback_reward_func(prompts, completions, answer, **kwargs) -> list[flo
                     for p, c, a in zip(prompts, completions, answer)]
     
     scores = []
-    # Call Claude API for each prompt and extract scores
+    # Call LLM API for each prompt and extract scores
     for judge_prompt in judge_prompts:
-        # Replace this with your actual Claude API call
-        claude_response = call_claude_api(judge_prompt)
+        # Replace this with your actual LLM API call
+        llm_response = call_qwen_api(judge_prompt)
         
-        # Extract score from Claude's response using regex to find content between <score> tags
-        import re
-        score_match = re.search(r'<score>(\d+)</score>', claude_response)
+        # Extract score from LLM's response using regex to find content between <score> tags
+        score_match = re.search(r'<score>(\d+)</score>', llm_response)
         
         if score_match:
-            score = float(score_match.group(1))
-            scores.append(score)
+            scores.append(int(score_match.group(1)))
         else:
             # If no score is found, default to 0
-            scores.append(0.0)
+            scores.append(0)
     
     return scores
 
