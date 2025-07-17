@@ -1,4 +1,4 @@
-# ARC-AGI Project
+# Abstract Reasoning Project
 
 ## Virtual Environment Setup
 
