@@ -1,6 +1,7 @@
 import argparse
 import math
 from typing import List, Dict, Any, Optional
+import copy
 
 import torch
 from torch.nn import functional as F
@@ -26,54 +27,52 @@ class GRPOTrainer:
     def __init__(
         self,
         model: torch.nn.Module,
+        ref_model: torch.nn.Module,
         lr: float = 1e-5,
         clip_ratio: float = 0.2,
         kl_coef: float = 0.01,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        dr: bool = True,
     ) -> None:
         self.model = model.to(device)
+        self.ref_model = ref_model.to(device)
+        self.ref_model.eval()
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
         self.clip_ratio = clip_ratio
         self.kl_coef = kl_coef
         self.device = device
+        self.dr = dr
 
     def _old_log_probs(self, logits: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         """Return log-probabilities of `actions` under the policy that produced `logits`."""
         log_probs = F.log_softmax(logits, dim=-1)
         return log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
 
-    def _policy_loss(
+    def _pg_loss(
         self,
         new_logp: torch.Tensor,
         old_logp: torch.Tensor,
         advantages: torch.Tensor,
     ) -> torch.Tensor:
-        """Core GRPO objective.
-        
-        GRPO uses a more direct policy gradient approach with proper KL regularization.
-        Unlike PPO which clips ratios, GRPO relies on KL penalty for stability.
-        """
-        # Compute probability ratio (pi_new / pi_old)
+        """Computes the policy gradient loss component."""
         ratio = torch.exp(new_logp - old_logp)
-        
-        # Optional clipping for stability (can be disabled by setting clip_ratio <= 0)
         if self.clip_ratio > 0:
             clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
-            # The PPO objective is min(ratio * advantages, clipped_ratio * advantages).
-            # We are minimizing the negative of this objective, which is equivalent to
-            # max(-(ratio * advantages), -(clipped_ratio * advantages)).
             pg_loss1 = -(ratio * advantages)
             pg_loss2 = -(clipped_ratio * advantages)
-            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+            return torch.max(pg_loss1, pg_loss2).mean()
         else:
-            # Pure GRPO without clipping
-            pg_loss = -(ratio * advantages).mean()
-        
-        # Proper KL divergence: D_KL(π_old || π_new) = E[log(π_old) - log(π_new)]
-        # This is reverse KL from old policy to new policy (standard in PPO/GRPO)
-        kl_loss = (old_logp - new_logp).mean()
-        
-        return pg_loss + self.kl_coef * kl_loss
+            return -(ratio * advantages).mean()
+
+    def _kl_loss(
+        self,
+        new_logp: torch.Tensor,
+        ref_logp: torch.Tensor,
+    ) -> torch.Tensor:
+        """Computes the KL divergence loss against the reference model."""
+        log_ratio_ref = ref_logp - new_logp
+        ratio_ref = torch.exp(log_ratio_ref)
+        return (ratio_ref - log_ratio_ref - 1).mean()
 
     def step(
         self,
@@ -101,6 +100,12 @@ class GRPOTrainer:
         logits = outputs.logits[:, :-1, :]  # exclude final position (no next-token)
         target_actions = actions[:, 1:]      # actions correspond to next-tokens
 
+        # Get log-probs from the reference model
+        with torch.no_grad():
+            ref_outputs = self.ref_model(input_ids)
+            ref_logits = ref_outputs.logits[:, :-1, :]
+            ref_logp = self._old_log_probs(ref_logits, target_actions)
+
         # Compute old log-probabilities (detach from graph)
         if old_logp is None:
             # First time - compute from current policy
@@ -109,19 +114,25 @@ class GRPOTrainer:
             # Use provided old_logp from original policy
             old_logp = old_logp.to(self.device)
 
-        # Compute advantages with sequence length normalization (mean=0, std=1)
-        # Normalize rewards by sequence length first
-        seq_lengths = (target_actions != 0).sum(dim=1).float().clamp(min=1.0)  # Assume 0 is pad token
-        normalized_rewards = rewards / seq_lengths
-        
-        advantages = normalized_rewards.unsqueeze(-1).expand_as(old_logp)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Compute advantages with optional sequence length normalization and standardization
+        if self.dr:
+            # Skip length normalization and std normalization when dr=True
+            advantages = rewards.unsqueeze(-1).expand_as(old_logp)
+            advantages = advantages - advantages.mean()  # Only center, don't normalize std
+        else:
+            # Apply full normalization (length + std) when dr=False
+            seq_lengths = (target_actions != 0).sum(dim=1).float().clamp(min=1.0)  # Assume 0 is pad token
+            normalized_rewards = rewards / seq_lengths
+            advantages = normalized_rewards.unsqueeze(-1).expand_as(old_logp)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # New log-probabilities for gradient flow
         new_logp = self._old_log_probs(logits, target_actions)
 
-        # Compute GRPO loss
-        loss = self._policy_loss(new_logp, old_logp, advantages)
+        # Compute loss components
+        pg_loss = self._pg_loss(new_logp, old_logp, advantages)
+        kl_loss = self._kl_loss(new_logp, ref_logp)
+        loss = pg_loss + self.kl_coef * kl_loss
 
         # Optimise
         self.optimizer.zero_grad()
@@ -129,12 +140,10 @@ class GRPOTrainer:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
-        with torch.no_grad():
-            approx_kl = (old_logp - new_logp).mean().item()
-
         return {
             "loss": loss.item(),
-            "approx_kl": approx_kl,
+            "pg_loss": pg_loss.item(),
+            "kl_loss": kl_loss.item(),
         }
 
 
@@ -145,11 +154,12 @@ class GRPOTrainer:
 def sample_math_batch(model, tokenizer, batch_size: int = 4, max_new_tokens: int = 512):
     """Generate a batch of math problems and model completions for GRPO training."""
     
-    # Generate math problems
-    problem_generator = generate_math_problems(tokenizer, batch_size)
-    problems = [next(problem_generator) for _ in range(batch_size)]
+    # Generate one math problem and use it for all batch elements
+    problem_generator = generate_math_problems(tokenizer, 1)
+    single_problem = next(problem_generator)
+    problems = [single_problem for _ in range(batch_size)]
     
-    # Extract prompts
+    # Extract prompts (all the same now)
     prompts = [problem["prompt"] for problem in problems]
     
     # Tokenize prompts
@@ -278,12 +288,12 @@ def main():
         default="Qwen/Qwen3-1.7B",
         help="HuggingFace model identifier.",
     )
-    parser.add_argument("--lr", type=float, default=3e-5, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--steps", type=int, default=10, help="Number of optimisation steps")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size (can be increased with LoRA)")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size (can be increased with LoRA)")
     parser.add_argument("--clip_ratio", type=float, default=0.2, help="PPO-style clip ratio")
     parser.add_argument("--kl_coef", type=float, default=0.01, help="KL penalty coefficient")
-    parser.add_argument("--max_new_tokens", type=int, default=512, help="Maximum new tokens to generate")
+    parser.add_argument("--max_new_tokens", type=int, default=1200, help="Maximum new tokens to generate")
     parser.add_argument("--epochs_per_batch", type=int, default=4, help="Number of optimization steps per batch")
     
     # LoRA configuration
@@ -292,11 +302,17 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha scaling parameter")
     parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout")
     
+    # Memory optimization
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing to save memory")
+    
     # Wandb and evaluation configuration
     parser.add_argument("--use_wandb", action="store_true", default=True, help="Use Weights & Biases for logging")
     parser.add_argument("--wandb_project", type=str, default="grpo-math-training", help="W&B project name")
     parser.add_argument("--wandb_run_name", type=str, default="custom-grpo", help="W&B run name")
     parser.add_argument("--eval_size", type=int, default=10, help="Number of problems for evaluation")
+    
+    # Reward normalization configuration
+    parser.add_argument("--dr", action="store_true", default=True, help="Disable reward normalization (skip length normalization and std division)")
     
     args = parser.parse_args()
 
@@ -317,13 +333,18 @@ def main():
     tokenizer.padding_side = 'left'
     
     config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
+    base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         config=config,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         device_map="auto",
         trust_remote_code=True,
     )
+
+    # Enable gradient checkpointing for memory efficiency
+    if args.gradient_checkpointing:
+        print("Enabling gradient checkpointing for memory optimization...")
+        base_model.gradient_checkpointing_enable()
 
     # Apply LoRA by default (unless disabled)
     if args.use_lora:
@@ -336,14 +357,23 @@ def main():
             bias="none",
             task_type="CAUSAL_LM"
         )
-        model = get_peft_model(model, lora_config)
+        model = get_peft_model(base_model, lora_config)
         model.print_trainable_parameters()
+        # With LoRA, the reference model is the frozen base model
+        ref_model = base_model
+    else:
+        print("Training full model. This will consume more memory.")
+        model = base_model
+        # Without LoRA, we must create a deep copy for the reference model
+        ref_model = copy.deepcopy(model)
 
     trainer = GRPOTrainer(
         model,
+        ref_model=ref_model,
         lr=args.lr,
         clip_ratio=args.clip_ratio,
         kl_coef=args.kl_coef,
+        dr=args.dr,
     )
 
     print("Starting GRPO fine-tuning with math problems …")
@@ -412,13 +442,14 @@ def main():
             total_steps += 1
             metrics = trainer.step(input_ids, actions, rewards, old_logp)
             episode_losses.append(metrics['loss'])
-            episode_kls.append(metrics['approx_kl'])
+            episode_kls.append(metrics['kl_loss'])
             
             # Log training metrics
             if args.use_wandb:
                 wandb.log({
                     "train/loss": metrics['loss'],
-                    "train/kl_divergence": metrics['approx_kl'],
+                    "train/pg_loss": metrics['pg_loss'],
+                    "train/kl_divergence": metrics['kl_loss'],
                     "train/batch_reward_mean": batch_reward_mean,
                     "train/batch_reward_max": batch_reward_max,
                     "train/batch_success_rate": batch_success_rate,
@@ -429,14 +460,14 @@ def main():
             print(
                 f"Episode {episode:04d}, Epoch {epoch+1:02d}/{args.epochs_per_batch} | "
                 f"loss: {metrics['loss']:.4f} | "
-                f"kl: {metrics['approx_kl']:.4f} | "
+                f"kl: {metrics['kl_loss']:.4f} | "
                 f"reward: {batch_reward_mean:.3f} | "
                 f"success: {batch_success_rate:.1%}"
             )
             
             # Early stopping if KL divergence gets too high
-            if metrics['approx_kl'] > 0.02:
-                print(f"  Early stopping due to high KL divergence: {metrics['approx_kl']:.4f}")
+            if metrics['kl_loss'] > 0.02:
+                print(f"  Early stopping due to high KL divergence: {metrics['kl_loss']:.4f}")
                 break
 
     # Final evaluation
