@@ -37,7 +37,7 @@ def parse_completion(completion: str) -> tuple[str, str]:
         return thinking_content, content
     
     # No </think> tag found
-    return "", completion.strip()
+    return "", ""
 
 def is_correct(content, target):
     """
@@ -380,7 +380,7 @@ def test_reward():
     """
     test_completions = [
         "(4 + 4) * 3",      # Should be incorrect: right math (24) but wrong numbers (uses 3, 3, 4, 4 but expression has only one 3)
-        "4 * 4 + 3 + 3",    # Should be correct: right math (24) and right numbers (3, 3, 4, 4)
+        "3 * 4 + 3 * 4",    # Should be correct: right math (24) and right numbers (3, 3, 4, 4)
         "4 + 4 + 3",        # Should be incorrect: wrong math (11) but uses some right numbers
         "10 * 2 + 4",       # Should be incorrect: right math (24) but wrong numbers (missing one 4, has 10 instead of specified numbers)
         "10 + 4 + 4 + 5 + 1", # Should be incorrect: right math (24) but wrong numbers (uses 5 numbers instead of 4)
