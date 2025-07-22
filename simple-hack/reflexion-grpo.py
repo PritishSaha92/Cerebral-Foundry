@@ -73,8 +73,9 @@ class GRPOTrainer:
         new_logp: torch.Tensor,
         old_logp: torch.Tensor,
         advantages: torch.Tensor,
+        mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Computes the policy gradient loss component."""
+        """Computes the policy gradient loss component, ignoring padded tokens."""
         ratio = torch.exp(new_logp - old_logp)
         if self.clip_ratio > 0:
             clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
@@ -82,37 +83,39 @@ class GRPOTrainer:
             pg_loss2 = -(clipped_ratio * advantages)
             pg_losses = torch.max(pg_loss1, pg_loss2)
             
-            # Debug: policy gradient loss statistics before mean
-            print(f"[DEBUG PG] pg_loss1: mean={pg_loss1.mean().item():.4f}, std={pg_loss1.std().item():.4f}, min={pg_loss1.min().item():.4f}, max={pg_loss1.max().item():.4f}")
-            print(f"[DEBUG PG] pg_loss2: mean={pg_loss2.mean().item():.4f}, std={pg_loss2.std().item():.4f}, min={pg_loss2.min().item():.4f}, max={pg_loss2.max().item():.4f}")
-            print(f"[DEBUG PG] final_pg_losses: mean={pg_losses.mean().item():.4f}, std={pg_losses.std().item():.4f}, min={pg_losses.min().item():.4f}, max={pg_losses.max().item():.4f}")
+            # Debug: policy gradient loss statistics before mean, using mask
+            print(f"[DEBUG PG] pg_loss1: mean={pg_loss1[mask].mean().item():.4f}, std={pg_loss1[mask].std().item():.4f}, min={pg_loss1[mask].min().item():.4f}, max={pg_loss1[mask].max().item():.4f}")
+            print(f"[DEBUG PG] pg_loss2: mean={pg_loss2[mask].mean().item():.4f}, std={pg_loss2[mask].std().item():.4f}, min={pg_loss2[mask].min().item():.4f}, max={pg_loss2[mask].max().item():.4f}")
+            print(f"[DEBUG PG] final_pg_losses: mean={pg_losses[mask].mean().item():.4f}, std={pg_losses[mask].std().item():.4f}, min={pg_losses[mask].min().item():.4f}, max={pg_losses[mask].max().item():.4f}")
             
-            # Count clipping statistics
+            # Count clipping statistics, using mask
             clipped_mask = (ratio < 1.0 - self.clip_ratio) | (ratio > 1.0 + self.clip_ratio)
-            clipped_fraction = clipped_mask.float().mean().item()
+            clipped_fraction = clipped_mask[mask].float().mean().item()
             print(f"[DEBUG PG] clipped_fraction: {clipped_fraction:.3f}")
             
-            return pg_losses.mean()
+            return pg_losses[mask].mean()
         else:
-            return -(ratio * advantages).mean()
+            unclipped_losses = -(ratio * advantages)
+            return unclipped_losses[mask].mean()
 
     def _kl_loss(
         self,
         new_logp: torch.Tensor,
         ref_logp: torch.Tensor,
+        mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Computes the KL divergence loss against the reference model."""
+        """Computes the KL divergence loss against the reference model, ignoring padded tokens."""
         log_ratio_ref = ref_logp - new_logp
         ratio_ref = torch.exp(log_ratio_ref)
         kl_losses = ratio_ref - log_ratio_ref - 1
         
-        # Debug: KL loss statistics
-        print(f"[DEBUG KL] log_ratio_ref: mean={log_ratio_ref.mean().item():.4f}, std={log_ratio_ref.std().item():.4f}, min={log_ratio_ref.min().item():.4f}, max={log_ratio_ref.max().item():.4f}")
-        print(f"[DEBUG KL] kl_losses: mean={kl_losses.mean().item():.4f}, std={kl_losses.std().item():.4f}, min={kl_losses.min().item():.4f}, max={kl_losses.max().item():.4f}")
+        # Debug: KL loss statistics, using mask
+        print(f"[DEBUG KL] log_ratio_ref: mean={log_ratio_ref[mask].mean().item():.4f}, std={log_ratio_ref[mask].std().item():.4f}, min={log_ratio_ref[mask].min().item():.4f}, max={log_ratio_ref[mask].max().item():.4f}")
+        print(f"[DEBUG KL] kl_losses: mean={kl_losses[mask].mean().item():.4f}, std={kl_losses[mask].std().item():.4f}, min={kl_losses[mask].min().item():.4f}, max={kl_losses[mask].max().item():.4f}")
         
-        return kl_losses.mean()
+        return kl_losses[mask].mean()
 
-    def step(
+    def compute_loss(
         self,
         input_ids: torch.Tensor,
         actions: torch.Tensor,
@@ -121,7 +124,8 @@ class GRPOTrainer:
         pad_token_id: int,
         old_logp: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """Run a single optimisation step on a batch.
+        """Compute the loss for a batch, but do not perform an optimization step.
+        This is used for gradient accumulation.
 
         Parameters
         ----------
@@ -181,30 +185,23 @@ class GRPOTrainer:
         # New log-probabilities for gradient flow
         new_logp = self._old_log_probs(logits, target_actions)
 
-        # # Debug logging for log-probs
-        # print("[DEBUG] old_logp: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}".format(
-        #     old_logp.mean().item(), old_logp.std().item(), old_logp.min().item(), old_logp.max().item()))
-        # print("[DEBUG] new_logp: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}".format(
-        #     new_logp.mean().item(), new_logp.std().item(), new_logp.min().item(), new_logp.max().item()))
-        # print("[DEBUG] ref_logp: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}".format(
-        #     ref_logp.mean().item(), ref_logp.std().item(), ref_logp.min().item(), ref_logp.max().item()))
+        # Create mask to ignore padding tokens in loss calculations.
+        # The mask should include all real tokens and the first pad/EOS token,
+        # but exclude all subsequent padding tokens.
+        is_pad = (target_actions == pad_token_id)
+        # The cumulative sum will be 0 for real tokens, 1 for the first pad
+        # token, and >1 for subsequent pad tokens. We keep everything <= 1.
+        mask = torch.cumsum(is_pad.to(torch.int), dim=1) <= 1
 
         # Compute loss components
-        pg_loss = self._pg_loss(new_logp, old_logp, advantages)
-        kl_loss = self._kl_loss(new_logp, ref_logp)
+        pg_loss = self._pg_loss(new_logp, old_logp, advantages, mask)
+        kl_loss = self._kl_loss(new_logp, ref_logp, mask)
         loss = pg_loss + self.kl_coef * kl_loss
 
-        # Optimise
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-
         return {
-            "loss": loss.item(),
+            "loss": loss,  # Return the loss tensor for backward pass
             "pg_loss": pg_loss.item(),
             "kl_loss": kl_loss.item(),
-            "lr": self.optimizer.param_groups[0]['lr'],
         }
 
     def _run_evaluation(
@@ -250,12 +247,14 @@ class GRPOTrainer:
         self,
         tokenizer: Any,
         steps: int,
-        epochs_per_batch: int,
+        gradient_accumulation_steps: int,
+        optim_epochs: int,
         batch_size: int,
         max_new_tokens: int,
         eval_dataset: Optional[Any] = None,
         use_wandb: bool = False,
         kl_threshold: float = 0.02,
+        use_revision: bool = False,
     ) -> Dict[str, Any]:
         """Train the model using GRPO.
         
@@ -263,18 +262,20 @@ class GRPOTrainer:
         ----------
         tokenizer : tokenizer for the model
         steps : total number of optimization steps
-        epochs_per_batch : number of optimization steps per batch
+        gradient_accumulation_steps : number of batches to accumulate gradients over
+        optim_epochs : number of optimization epochs to run on each collected batch of experience
         batch_size : batch size for training
         max_new_tokens : maximum new tokens to generate
         eval_dataset : optional dataset for evaluation
         use_wandb : whether to log to wandb
         kl_threshold : KL divergence threshold for early stopping
+        use_revision : whether to use revision model for sampling
         
         Returns
         -------
         Dict with training statistics
         """
-        total_steps = 0
+        total_optim_steps = 0
         training_rewards = []
         
         # Initial evaluation if eval dataset provided
@@ -285,83 +286,153 @@ class GRPOTrainer:
         # Set the model back to train mode for training
         self.model.train()
         
-        # Main training loop
-        for episode in range(1, steps // epochs_per_batch + 1):
-            # Sample once (expensive)
-            batch = sample_math_batch(self.model, tokenizer, batch_size=batch_size, max_new_tokens=max_new_tokens)
-            input_ids, actions, rewards, prompt_length, pad_token_id = batch
+        # Main training loop (steps are now data collection cycles)
+        for step in range(1, steps + 1):
             
-            # Track batch rewards
-            batch_reward_mean = rewards.mean().item()
-            batch_reward_max = rewards.max().item()
-            batch_success_rate = (rewards > 0).float().mean().item()
-            training_rewards.extend(rewards.tolist())
+            # --- 1. Data Collection Phase ---
+            experience_buffer = []
+            step_rewards_mean = []
+            step_rewards_max = []
+            step_success_rates = []
+
+            print(f"\nCollecting experience for step {step}/{steps}...")
+            for micro_step in range(gradient_accumulation_steps):
+                # Sample a fresh batch for each accumulation step
+                if use_revision:
+                    batch = sample_and_revise_math_batch(
+                        model=self.model,
+                        tokenizer=tokenizer,
+                        revision_model=self.model,
+                        batch_size=batch_size,
+                        max_new_tokens=max_new_tokens,
+                        pad=True,
+                        disable_adapter=False,
+                        enable_thinking=False
+                    )
+                else:
+                    batch = sample_math_batch(self.model, tokenizer, batch_size=batch_size, max_new_tokens=max_new_tokens)
+                
+                input_ids, actions, rewards, prompt_length, pad_token_id, _, _ = batch
+                
+                # Pre-compute old_logp based on the policy at the time of collection
+                with torch.no_grad():
+                    outputs = self.model(input_ids.to(self.device))
+                    logits = outputs.logits[:, prompt_length-1:-1, :]
+                    target_actions = actions.to(self.device)
+                    old_logp = self._old_log_probs(logits, target_actions)
+                
+                experience_buffer.append({
+                    'input_ids': input_ids, 'actions': actions, 'rewards': rewards,
+                    'prompt_length': prompt_length, 'pad_token_id': pad_token_id,
+                    'old_logp': old_logp
+                })
+                
+                # Track and log rewards from this collection micro-batch
+                batch_reward_mean = rewards.mean().item()
+                training_rewards.extend(rewards.tolist())
+                step_rewards_mean.append(batch_reward_mean)
+                step_rewards_max.append(rewards.max().item())
+                step_success_rates.append((rewards > 0).float().mean().item())
+                print(f"  Collected micro-batch {micro_step+1}/{gradient_accumulation_steps} | reward: {batch_reward_mean:.3f}")
             
-            # Compute old_logp ONCE from current policy
-            with torch.no_grad():
-                outputs = self.model(input_ids.to(self.device))
-                # Extract logits only for positions predicting generated tokens
-                logits = outputs.logits[:, prompt_length-1:-1, :]
-                target_actions = actions.to(self.device)  # actions are already just generated tokens
-                old_logp = self._old_log_probs(logits, target_actions)
-            
-            # Take multiple optimization steps using same old_logp
-            episode_losses = []
-            episode_kls = []
-            
-            for epoch in range(epochs_per_batch):
-                total_steps += 1
-                metrics = self.step(input_ids, actions, rewards, prompt_length, pad_token_id, old_logp)
-                episode_losses.append(metrics['loss'])
-                episode_kls.append(metrics['kl_loss'])
+            # --- 2. Optimization Phase ---
+            for epoch in range(optim_epochs):
+                self.optimizer.zero_grad()
+                
+                epoch_losses = []
+                epoch_pg_losses = []
+                epoch_kls = []
+
+                # Iterate over the collected experience
+                for micro_batch_data in experience_buffer:
+                    # Compute loss for the micro-batch using the pre-computed old_logp
+                    metrics = self.compute_loss(
+                        input_ids=micro_batch_data['input_ids'],
+                        actions=micro_batch_data['actions'],
+                        rewards=micro_batch_data['rewards'],
+                        prompt_length=micro_batch_data['prompt_length'],
+                        pad_token_id=micro_batch_data['pad_token_id'],
+                        old_logp=micro_batch_data['old_logp']
+                    )
+                    loss = metrics['loss']
+                    
+                    # Normalize loss for accumulation across the buffer
+                    loss = loss / len(experience_buffer)
+                    
+                    # Accumulate gradients
+                    loss.backward()
+
+                    # Store metrics for logging
+                    epoch_losses.append(loss.item() * len(experience_buffer))
+                    epoch_pg_losses.append(metrics['pg_loss'])
+                    epoch_kls.append(metrics['kl_loss'])
+                
+                # Clip gradients and perform optimizer step after accumulating over the whole buffer
+                total_optim_steps += 1
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
                 
                 # Step the learning rate scheduler
                 if self.scheduler is not None:
                     self.scheduler.step()
+                    
+                # Log aggregated metrics for the optimization step
+                avg_loss = sum(epoch_losses) / len(epoch_losses)
+                avg_pg_loss = sum(epoch_pg_losses) / len(epoch_pg_losses)
+                avg_kl = sum(epoch_kls) / len(epoch_kls)
+                avg_reward_mean = sum(step_rewards_mean) / len(step_rewards_mean)
+                avg_reward_max = sum(step_rewards_max) / len(step_rewards_max)
+                avg_success_rate = sum(step_success_rates) / len(step_success_rates)
                 
-                # Log training metrics
+                current_lr = self.optimizer.param_groups[0]['lr']
+
                 if use_wandb:
                     wandb.log({
-                        "train/loss": metrics['loss'],
-                        "train/pg_loss": metrics['pg_loss'],
-                        "train/kl_divergence": metrics['kl_loss'],
-                        "train/learning_rate": metrics['lr'],
-                        "train/batch_reward_mean": batch_reward_mean,
-                        "train/batch_reward_max": batch_reward_max,
-                        "train/batch_success_rate": batch_success_rate,
-                        "episode": episode,
-                        "step": total_steps
+                        "train/loss": avg_loss,
+                        "train/pg_loss": avg_pg_loss,
+                        "train/kl_divergence": avg_kl,
+                        "train/learning_rate": current_lr,
+                        "train/batch_reward_mean": avg_reward_mean,
+                        "train/batch_reward_max": avg_reward_max,
+                        "train/batch_success_rate": avg_success_rate,
+                        "step": total_optim_steps,
+                        "collection_step": step,
+                        "optim_epoch": epoch + 1,
                     })
                 
                 print(
-                    f"Episode {episode:04d}, Epoch {epoch+1:02d}/{epochs_per_batch} | "
-                    f"Step: {total_steps:05d} | "
-                    f"loss: {metrics['loss']:.4f} | "
-                    f"kl: {metrics['kl_loss']:.4f} | "
-                    f"lr: {metrics['lr']:.2e} | "
-                    f"reward: {batch_reward_mean:.3f} | "
-                    f"success: {batch_success_rate:.1%}"
+                    f"Optim Step {total_optim_steps:05d} | Collection Step {step}/{steps}, Epoch {epoch+1}/{optim_epochs} | "
+                    f"loss: {avg_loss:.4f} | "
+                    f"kl: {avg_kl:.4f} | "
+                    f"lr: {current_lr:.2e} | "
+                    f"reward: {avg_reward_mean:.3f} | "
+                    f"success: {avg_success_rate:.1%}"
                 )
-                
+                    
                 # Early stopping if KL divergence gets too high
-                if metrics['kl_loss'] > kl_threshold:
-                    print(f"  Early stopping due to high KL divergence: {metrics['kl_loss']:.4f}")
+                if avg_kl > kl_threshold:
+                    print(f"  Early stopping epoch due to high KL divergence: {avg_kl:.4f}")
                     break
+            
+            # Break outer loop if KL is high
+            if avg_kl > kl_threshold:
+                print(f"  Early stopping collection step due to high KL divergence.")
+                break
 
         # Final evaluation if eval dataset provided
         if eval_dataset is not None:
-            final_metrics = self._run_evaluation(eval_dataset, tokenizer, max_new_tokens, "final", episode, use_wandb)
+            final_metrics = self._run_evaluation(eval_dataset, tokenizer, max_new_tokens, "final", total_optim_steps, use_wandb)
                 
             # Log training summary
             if use_wandb and wandb.run is not None:
-                wandb.run.summary["total_steps"] = total_steps
+                wandb.run.summary["total_steps"] = total_optim_steps
                 wandb.run.summary["final_success_rate"] = final_metrics.get("eval_success_rate", 0)
                 wandb.run.summary["improvement"] = final_metrics.get("eval_success_rate", 0) - initial_metrics.get("eval_success_rate", 0)
 
         print("Training complete!")
         
         return {
-            "total_steps": total_steps,
+            "total_steps": total_optim_steps,
             "training_rewards": training_rewards,
             "final_metrics": final_metrics if eval_dataset is not None else None,
             "initial_metrics": initial_metrics if eval_dataset is not None else None,
@@ -393,62 +464,103 @@ def generate_with_cache(model, **kwargs):
     return generated_ids
 
 
-# ---------------------------------------------------------------------------
-# Math environment using 24-game problems
-# ---------------------------------------------------------------------------
+def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapter=False, enable_thinking: bool = True, **gen_kwargs):
+    """Generates completions from a model and decodes them."""
+    
+    # Convert prompts to chat message format
+    messages_list = [[{"role": "user", "content": p}] for p in prompts]
+    
+    # Apply chat template with thinking mode control
+    # This creates the full prompt string including special tokens
+    processed_prompts = [
+        tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking
+        ) for messages in messages_list
+    ]
 
-def sample_math_batch(model, tokenizer, batch_size: int = 4, max_new_tokens: int = 512):
-    """Generate a batch of math problems and model completions for GRPO training."""
+    tokenized = tokenizer(processed_prompts, return_tensors="pt", padding=True, truncation=True)
     
-    # Generate one math problem and use it for all batch elements
-    problem_generator = generate_math_problems(tokenizer, 1)
-    single_problem = next(problem_generator)
-    problems = [single_problem for _ in range(batch_size)]
+    # Base generation arguments
+    base_gen_kwargs = {
+        "input_ids": tokenized["input_ids"].to(model.device),
+        "attention_mask": tokenized["attention_mask"].to(model.device),
+        "max_new_tokens": max_new_tokens,
+        "temperature": 0.7,
+        "do_sample": True,
+        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+        "repetition_penalty": 1.1,
+    }
+    # Update with any additional kwargs
+    base_gen_kwargs.update(gen_kwargs)
     
-    # Extract prompts (all the same now)
-    prompts = [problem["prompt"] for problem in problems]
-    
-    # Tokenize prompts
-    tokenized = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-    input_ids = tokenized["input_ids"]
-    attention_mask = tokenized["attention_mask"]
-    
-    # Generate completions using the model
-    generated = generate_with_cache(
-        model,
-        input_ids=input_ids.to(model.device),
-        attention_mask=attention_mask.to(model.device),
-        max_new_tokens=max_new_tokens,
-        temperature=0.7,
-        do_sample=True,
-        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-        repetition_penalty=1.1
-    )
-    
-    # Extract only the generated parts (remove prompt)
-    generated_tokens = generated[:, input_ids.shape[1]:]
-    
-    # Decode completions
+    # Handle adapter disabling for PEFT models
+    if disable_adapter and hasattr(model, "disable_adapter"):
+        with model.disable_adapter():  # type: ignore[attr-defined]
+            generated_ids = generate_with_cache(model, **base_gen_kwargs)
+    else:
+        generated_ids = generate_with_cache(model, **base_gen_kwargs)
+        
+    # Extract, decode, and return completions
+    prompt_length = tokenized["input_ids"].shape[1]
+    generated_tokens = generated_ids[:, prompt_length:]
     completions = [tokenizer.decode(gen, skip_special_tokens=True) for gen in generated_tokens]
     
-    # Calculate rewards using math reward function
+    return completions
+
+
+def _create_batch_from_prompts(prompts, completions, tokenizer, batch_size, pad):
+    """Create a batch for the trainer from prompts and completions."""
     rewards = torch.tensor(math_reward_func(completions, prompts), dtype=torch.float32)
-    
-    # Concatenate input_ids and generated_tokens for full sequences
-    # Move input_ids to the same device as generated_tokens
-    input_ids = input_ids.to(generated.device)
-    full_sequences = generated
-    
-    # For GRPO, actions should only be the generated tokens (not prompt + completion)
-    actions = generated_tokens.clone()
-    
-    # Store the prompt length (same for all items in batch since we use same problem)
-    prompt_length = input_ids.shape[1]
-    
-    # Store the pad token ID for consistent usage
     pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
     
-    # Pad sequences to same length for batch processing
+    # Get a consistent prompt length by padding
+    tokenized_prompts = tokenizer(prompts, padding=True, return_tensors="pt")
+    prompt_length = tokenized_prompts['input_ids'].shape[1]
+
+    # Tokenize completions and create full sequences
+    full_sequences = []
+    actions = []
+    
+    tokenized_prompts_list = tokenizer(prompts, padding=False, truncation=True)['input_ids']
+    tokenized_completions_list = tokenizer(completions, padding=False, truncation=True)['input_ids']
+
+    for i in range(batch_size):
+        prompt_toks = torch.tensor(tokenized_prompts_list[i], dtype=torch.long)
+        completion_toks = torch.tensor(tokenized_completions_list[i], dtype=torch.long)
+        
+        full_seq = torch.cat([prompt_toks, completion_toks])
+        full_sequences.append(full_seq)
+        actions.append(completion_toks)
+
+    if pad:
+        input_ids, actions = pad_sequences_for_batch(full_sequences, actions, batch_size, pad_token_id)
+    else:
+        input_ids = full_sequences
+        
+    return input_ids, actions, rewards, prompt_length, pad_token_id
+
+def pad_sequences_for_batch(full_sequences, generated_tokens, batch_size, pad_token_id):
+    """Pad sequences to same length for batch processing.
+    
+    Parameters
+    ----------
+    full_sequences : list of torch.Tensor
+        Full sequences (prompt + generated tokens)
+    generated_tokens : list of torch.Tensor
+        Generated tokens only
+    batch_size : int
+        Size of the batch
+    pad_token_id : int
+        Token ID to use for padding
+        
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        Padded input_ids and actions tensors
+    """
     max_full_len = max(seq.shape[0] for seq in full_sequences)
     max_action_len = max(seq.shape[0] for seq in generated_tokens)
     padded_input_ids = []
@@ -477,26 +589,114 @@ def sample_math_batch(model, tokenizer, batch_size: int = 4, max_new_tokens: int
     input_ids = torch.stack(padded_input_ids)
     actions = torch.stack(padded_actions)
     
-    return input_ids, actions, rewards, prompt_length, pad_token_id
+    return input_ids, actions
+
+def sample_and_revise_math_batch(
+    model, 
+    tokenizer, 
+    revision_model,
+    batch_size: int, 
+    max_new_tokens: int, 
+    pad: bool, 
+    disable_adapter: bool, 
+    enable_thinking: bool
+):
+    """
+    Samples a batch, revises it, and returns the revised batch.
+    1. Sample a batch of completions from the base model.
+    2. Use a revision model to revise the completions.
+    3. Return the revised completions and their rewards.
+    """
+    # 1. First pass: Sample from the base model to get initial solutions
+    _, _, _, _, _, prompts, initial_completions = sample_math_batch(
+        model, tokenizer, batch_size, max_new_tokens, pad=True
+    )
+
+    # 2. Second pass: Construct revision prompts and revise with the revision_model
+    revision_prompts = []
+    for i in range(batch_size):
+        full_sequence_text = prompts[i] + initial_completions[i]
+        # For revision, we can just use the initial completion's reward, though it's not strictly necessary.
+        # Here, we will just pass a placeholder since the prompt is about revision.
+        # A more advanced implementation could use the reward to guide revision.
+                
+        revision_prompt = f"""The following is a solution to a math problem.
+Problem and solution:
+"{full_sequence_text}"
+
+Your task is to revise the chain-of-thought (content in <think> tags) to be more concise and possibly change/complete the final answer. Keep all tokens in the chain-of-thought that are helpful to achieving the correct answer. Eliminate dead ends.
+
+The revised completion should be in the format: <think>chain-of-thought</think> answer.
+"""
+        revision_prompts.append(revision_prompt)
+    
+    # Generate revised completions
+    revised_completions = generate_and_decode(
+        revision_model,
+        tokenizer,
+        revision_prompts,
+        max_new_tokens,
+        disable_adapter=disable_adapter,
+        enable_thinking=enable_thinking,
+    )
+
+    # Use revised final answers only if thinking mode is enabled, otherwise use original completions
+    if enable_thinking:
+        # Extract just the final answer (not the thinking content) from revised completions
+        final_completions = [parse_completion(completion)[1] for completion in revised_completions]
+    else:
+        final_completions = revised_completions
+    
+    # Create the batch from prompts and generated completions
+    input_ids, actions, rewards, prompt_length, pad_token_id = _create_batch_from_prompts(
+        prompts, final_completions, tokenizer, batch_size, pad
+    )
+    
+    return input_ids, actions, rewards, prompt_length, pad_token_id, prompts, final_completions
 
 
-def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512):
-    """Simple evaluation function that generates completions and calculates rewards."""
+def sample_math_batch(model, tokenizer, batch_size: int = 4, max_new_tokens: int = 512, pad: bool = True):
+    """Generate a batch of math problems and model completions for GRPO training."""
+    
+    # Generate one math problem and use it for all batch elements
+    problem_generator = generate_math_problems(tokenizer, 1)
+    single_problem = next(problem_generator)
+    problems = [single_problem for _ in range(batch_size)]
+    
+    # Extract prompts (all the same now)
+    prompts = [problem["prompt"] for problem in problems]
+
+    # Generate completions using the model
+    completions = generate_and_decode(model, tokenizer, prompts, max_new_tokens, enable_thinking=True)
+    
+    # Create the batch from prompts and generated completions
+    input_ids, actions, rewards, prompt_length, pad_token_id = _create_batch_from_prompts(
+        prompts, completions, tokenizer, batch_size, pad
+    )
+    
+    return input_ids, actions, rewards, prompt_length, pad_token_id, prompts, completions
+
+
+def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_size=12):
+    """Batched evaluation function that generates completions and calculates rewards."""
     
     model.eval()
     total_reward = 0.0
     total_samples = 0
     success_count = 0
     
-    # Process evaluation dataset
-    for sample in eval_dataset:
-        prompt = sample["query"]
-        target = sample["target"]
+    # Convert dataset to list if it's not already
+    eval_samples = list(eval_dataset)
+    
+    # Process evaluation dataset in batches
+    for i in range(0, len(eval_samples), batch_size):
+        batch_samples = eval_samples[i:i+batch_size]
+        batch_prompts = [sample["query"] for sample in batch_samples]
         
-        # Tokenize the prompt
-        inputs = tokenizer(prompt, return_tensors="pt", padding=True, truncation=True)
+        # Tokenize the batch of prompts
+        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True)
         
-        # Generate completion
+        # Generate completions for the batch
         generated = generate_with_cache(
             model,
             input_ids=inputs["input_ids"].to(model.device),
@@ -508,19 +708,20 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512):
             repetition_penalty=1.1
         )
         
-        # Extract only the generated part
+        # Extract only the generated parts and decode completions
         prompt_length = inputs["input_ids"].shape[1]
         generated_tokens = generated[:, prompt_length:]
-        completion = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+        completions = [tokenizer.decode(gen, skip_special_tokens=True) for gen in generated_tokens]
         
-        # Calculate reward
-        rewards = math_reward_func([completion], [prompt])
-        reward = rewards[0]
+        # Calculate rewards for the batch
+        batch_rewards = math_reward_func(completions, batch_prompts)
         
-        total_reward += reward
-        total_samples += 1
-        if reward > 0:
-            success_count += 1
+        # Accumulate statistics
+        for reward in batch_rewards:
+            total_reward += reward
+            total_samples += 1
+            if reward > 0:
+                success_count += 1
     
     # Calculate metrics
     avg_reward = total_reward / total_samples if total_samples > 0 else 0.0
@@ -552,7 +753,8 @@ def main():
     parser.add_argument("--clip_ratio", type=float, default=0.2, help="PPO-style clip ratio")
     parser.add_argument("--kl_coef", type=float, default=0.01, help="KL penalty coefficient")
     parser.add_argument("--max_new_tokens", type=int, default=1200, help="Maximum new tokens to generate")
-    parser.add_argument("--epochs_per_batch", type=int, default=4, help="Number of optimization steps per batch")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of batches to accumulate gradients over before performing an optimizer step")
+    parser.add_argument("--optim_epochs", type=int, default=4, help="Number of optimization epochs to run on each collected batch of experience")
     
     # LoRA configuration
     parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA for parameter-efficient fine-tuning")
@@ -574,6 +776,9 @@ def main():
     
     # KL threshold configuration
     parser.add_argument("--kl_threshold", type=float, default=0.02, help="KL divergence threshold for early stopping")
+    
+    # Revision configuration
+    parser.add_argument("--use_revision", action="store_true", default=False, help="Use revision model to revise completions during sampling.")
     
     # Learning rate scheduler configuration
     parser.add_argument("--lr_schedule", action="store_true", default=True, help="Use linear learning rate decay")
@@ -633,6 +838,9 @@ def main():
         # Without LoRA, we must create a deep copy for the reference model
         ref_model = copy.deepcopy(model)
 
+    total_optim_steps = args.steps * args.optim_epochs
+    print(f"Total optimization steps: {total_optim_steps}")
+
     trainer = GRPOTrainer(
         model,
         ref_model=ref_model,
@@ -640,7 +848,7 @@ def main():
         clip_ratio=args.clip_ratio,
         kl_coef=args.kl_coef,
         dr=args.dr,
-        total_steps=args.steps,
+        total_steps=total_optim_steps,
         lr_schedule=args.lr_schedule,
         min_lr_ratio=args.min_lr_ratio,
     )
@@ -670,12 +878,14 @@ def main():
     training_results = trainer.train(
         tokenizer=tokenizer,
         steps=args.steps,
-        epochs_per_batch=args.epochs_per_batch,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        optim_epochs=args.optim_epochs,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
         eval_dataset=eval_dataset,
         use_wandb=args.use_wandb,
         kl_threshold=args.kl_threshold,
+        use_revision=args.use_revision,
     )
 
     print("Training complete!")
