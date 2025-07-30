@@ -1,15 +1,18 @@
 import argparse
 import math
 import random
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import copy
+
 import torch
 from torch.nn import functional as F
 from torch.optim.lr_scheduler import LinearLR
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from peft import LoraConfig, get_peft_model
 import wandb
+
 from datasets import Dataset
+
 # Import math problem generation and reward functions
 from functions import generate_math_problems, math_reward_func, parse_completion
 
@@ -72,9 +75,10 @@ class GRPOTrainer:
         old_logp: torch.Tensor,
         advantages: torch.Tensor,
         mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, float]:
         """Computes the policy gradient loss component, ignoring padded tokens."""
         ratio = torch.exp(new_logp - old_logp)
+        clipped_fraction = 0.0
         if self.clip_ratio > 0:
             clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
             pg_loss1 = -(ratio * advantages)
@@ -91,10 +95,10 @@ class GRPOTrainer:
             clipped_fraction = clipped_mask[mask].float().mean().item()
             print(f"[DEBUG PG] clipped_fraction: {clipped_fraction:.3f}")
             
-            return pg_losses[mask].mean()
+            return pg_losses[mask].mean(), clipped_fraction
         else:
             unclipped_losses = -(ratio * advantages)
-            return unclipped_losses[mask].mean()
+            return unclipped_losses[mask].mean(), clipped_fraction
 
     def _kl_loss(
         self,
@@ -134,6 +138,10 @@ class GRPOTrainer:
         pad_token_id : int, token ID used for padding
         old_logp   : (B, G) old log probabilities for generated tokens only
         """
+        # Ensure deterministic computation (disable dropout) for both old and new log-probs
+        was_training = self.model.training
+        self.model.eval()
+
         input_ids = input_ids.to(self.device)
         actions = actions.to(self.device)
         rewards = rewards.to(self.device)
@@ -192,14 +200,19 @@ class GRPOTrainer:
         mask = torch.cumsum(is_pad.to(torch.int), dim=1) <= 1
 
         # Compute loss components
-        pg_loss = self._pg_loss(new_logp, old_logp, advantages, mask)
+        pg_loss, clipped_fraction = self._pg_loss(new_logp, old_logp, advantages, mask)
         kl_loss = self._kl_loss(new_logp, ref_logp, mask)
         loss = pg_loss + self.kl_coef * kl_loss
+
+        # Restore original training/eval state of the model
+        if was_training:
+            self.model.train()
 
         return {
             "loss": loss,  # Return the loss tensor for backward pass
             "pg_loss": pg_loss.item(),
             "kl_loss": kl_loss.item(),
+            "clipped_fraction": clipped_fraction,
         }
 
     def _run_evaluation(
@@ -314,12 +327,16 @@ class GRPOTrainer:
                 
                 input_ids, actions, rewards, prompt_length, pad_token_id, _, _ = batch
                 
-                # Pre-compute old_logp based on the policy at the time of collection
+                # Pre-compute old_logp with dropout disabled for deterministic ratios
+                was_training = self.model.training
+                self.model.eval()
                 with torch.no_grad():
                     outputs = self.model(input_ids.to(self.device))
                     logits = outputs.logits[:, prompt_length-1:-1, :]
                     target_actions = actions.to(self.device)
                     old_logp = self._old_log_probs(logits, target_actions)
+                if was_training:
+                    self.model.train()
                 
                 experience_buffer.append({
                     'input_ids': input_ids, 'actions': actions, 'rewards': rewards,
@@ -336,6 +353,7 @@ class GRPOTrainer:
                 print(f"  Collected micro-batch {micro_step+1}/{batch_size} | reward: {batch_reward_mean:.3f}")
             
             # --- 2. Optimization Phase ---
+            kl_exceeded = False
             for epoch in range(epochs_per_batch):
                 random.shuffle(experience_buffer)  # Shuffle experience for each epoch
                 
@@ -348,6 +366,7 @@ class GRPOTrainer:
                     minibatch_losses = []
                     minibatch_pg_losses = []
                     minibatch_kls = []
+                    minibatch_clipped_fractions = []
 
                     # Iterate over the collected experience in the minibatch
                     for micro_batch_data in minibatch:
@@ -372,7 +391,17 @@ class GRPOTrainer:
                         minibatch_losses.append(loss.item() * len(minibatch))
                         minibatch_pg_losses.append(metrics['pg_loss'])
                         minibatch_kls.append(metrics['kl_loss'])
+                        minibatch_clipped_fractions.append(metrics['clipped_fraction'])
                     
+                    # Aggregate KL divergence from the minibatch
+                    avg_kl = sum(minibatch_kls) / len(minibatch_kls) if minibatch_kls else 0.0
+
+                    # Check KL threshold before optimizer step
+                    if avg_kl > kl_threshold:
+                        print(f"  KL divergence {avg_kl:.4f} exceeds threshold {kl_threshold}. Abandoning optimization for this batch.")
+                        kl_exceeded = True
+                        break
+
                     # Clip gradients and perform optimizer step after accumulating over the whole minibatch
                     total_optim_steps += 1
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -388,7 +417,7 @@ class GRPOTrainer:
                     # Log aggregated metrics for the optimization step
                     avg_loss = sum(minibatch_losses) / len(minibatch_losses)
                     avg_pg_loss = sum(minibatch_pg_losses) / len(minibatch_pg_losses)
-                    avg_kl = sum(minibatch_kls) / len(minibatch_kls)
+                    avg_clipped_fraction = sum(minibatch_clipped_fractions) / len(minibatch_clipped_fractions)
                     
                     # Compute reward metrics from the current minibatch
                     minibatch_rewards = torch.cat([data['rewards'] for data in minibatch])
@@ -401,6 +430,7 @@ class GRPOTrainer:
                             "train/loss": avg_loss,
                             "train/pg_loss": avg_pg_loss,
                             "train/kl_divergence": avg_kl,
+                            "train/clipped_fraction": avg_clipped_fraction,
                             "train/learning_rate": current_lr,
                             "train/batch_reward_mean": avg_reward_mean,
                             "train/batch_reward_max": avg_reward_max,
@@ -417,24 +447,14 @@ class GRPOTrainer:
                         f"Optim Step {total_optim_steps:05d} | Collection Step {step}/{collection_steps}, Epoch {epoch+1}/{epochs_per_batch}, MiniBatch {minibatch_num}/{total_minibatches} | "
                         f"loss: {avg_loss:.4f} | "
                         f"kl: {avg_kl:.4f} | "
+                        f"clipped: {avg_clipped_fraction:.3f} | "
                         f"lr: {current_lr:.2e} | "
                         f"reward: {avg_reward_mean:.3f} | "
                         f"success: {avg_success_rate:.1%}"
                     )
-                        
-                    # Early stopping if KL divergence gets too high
-                    if avg_kl > kl_threshold:
-                        print(f"  Early stopping epoch due to high KL divergence: {avg_kl:.4f}")
-                        break
                 
-                # Break outer loop if KL is high
-                if avg_kl > kl_threshold:
+                if kl_exceeded:
                     break
-            
-            # Break outer loop if KL is high
-            if 'avg_kl' in locals() and avg_kl > kl_threshold:
-                print(f"  Early stopping collection step due to high KL divergence.")
-                break
 
         # Final evaluation if eval dataset provided
         if eval_dataset is not None:
@@ -793,7 +813,7 @@ def main():
     parser.add_argument("--dr", action="store_true", default=True, help="Disable reward normalization (skip length normalization and std division)")
     
     # KL threshold configuration
-    parser.add_argument("--kl_threshold", type=float, default=0.02, help="KL divergence threshold for early stopping")
+    parser.add_argument("--kl_threshold", type=float, default=10, help="KL divergence threshold for early stopping")
     
     # Revision configuration
     parser.add_argument("--use_revision", action="store_true", default=False, help="Use revision model to revise completions during sampling.")
