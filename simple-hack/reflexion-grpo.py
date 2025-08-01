@@ -211,6 +211,13 @@ class GRPOTrainer:
         # token, and >1 for subsequent pad tokens. We keep everything <= 1.
         mask = torch.cumsum(is_pad.to(torch.int), dim=1) <= 1
 
+        # Calculate model entropy over non-padded tokens for logging
+        with torch.no_grad():
+            # Use the already-sampled actions to estimate entropy
+            # This is analogous to how we compute KL divergence using sampled log probs
+            estimated_entropy = -new_logp  # Entropy ≈ -E[log p(x)] where x ~ p
+            mean_entropy = estimated_entropy[mask].mean().item()
+
         # Compute loss components
         pg_loss, clipped_fraction = self._pg_loss(new_logp, old_logp, advantages, mask)
         kl_loss = self._kl_loss(new_logp, ref_logp, mask)
@@ -220,11 +227,16 @@ class GRPOTrainer:
         if was_training:
             self.model.train()
 
+        response_lengths = (target_actions != pad_token_id).sum(dim=1).float()
+        avg_response_length = response_lengths.mean().item()
+
         return {
             "loss": loss,  # Return the loss tensor for backward pass
             "pg_loss": pg_loss.item(),
             "kl_loss": kl_loss.item(),
             "clipped_fraction": clipped_fraction,
+            "avg_response_length": avg_response_length,
+            "model_entropy": mean_entropy,
         }
 
     def _run_evaluation(
@@ -261,6 +273,7 @@ class GRPOTrainer:
             wandb.log({
                 f"{eval_type}_eval/success_rate": metrics.get("eval_success_rate", 0),
                 f"{eval_type}_eval/reward_mean": metrics.get("eval_reward_mean", 0),
+                f"{eval_type}_eval/avg_response_length": metrics.get("eval_avg_response_length", 0),
                 "episode": episode
             })
         
@@ -383,6 +396,8 @@ class GRPOTrainer:
                     minibatch_pg_losses = []
                     minibatch_kls = []
                     minibatch_clipped_fractions = []
+                    minibatch_response_lengths = []
+                    minibatch_entropies = []
 
                     # Iterate over the collected experience in the minibatch
                     for micro_batch_data in minibatch:
@@ -408,6 +423,8 @@ class GRPOTrainer:
                         minibatch_pg_losses.append(metrics['pg_loss'])
                         minibatch_kls.append(metrics['kl_loss'])
                         minibatch_clipped_fractions.append(metrics['clipped_fraction'])
+                        minibatch_response_lengths.append(metrics['avg_response_length'])
+                        minibatch_entropies.append(metrics['model_entropy'])
                     
                     # Aggregate KL divergence from the minibatch
                     avg_kl = sum(minibatch_kls) / len(minibatch_kls) if minibatch_kls else 0.0
@@ -434,6 +451,8 @@ class GRPOTrainer:
                     avg_loss = sum(minibatch_losses) / len(minibatch_losses)
                     avg_pg_loss = sum(minibatch_pg_losses) / len(minibatch_pg_losses)
                     avg_clipped_fraction = sum(minibatch_clipped_fractions) / len(minibatch_clipped_fractions)
+                    avg_response_length = sum(minibatch_response_lengths) / len(minibatch_response_lengths)
+                    avg_entropy = sum(minibatch_entropies) / len(minibatch_entropies)
                     
                     # Compute reward metrics from the current minibatch
                     minibatch_rewards = torch.cat([data['rewards'] for data in minibatch])
@@ -447,10 +466,12 @@ class GRPOTrainer:
                             "train/pg_loss": avg_pg_loss,
                             "train/kl_divergence": avg_kl,
                             "train/clipped_fraction": avg_clipped_fraction,
+                            "train/avg_response_length": avg_response_length,
                             "train/learning_rate": current_lr,
                             "train/batch_reward_mean": avg_reward_mean,
                             "train/batch_reward_max": avg_reward_max,
                             "train/batch_success_rate": avg_success_rate,
+                            "train/model_entropy": avg_entropy,
                             "step": total_optim_steps,
                             "collection_step": collection_step,
                             "epoch_per_batch": epoch + 1,
@@ -464,9 +485,11 @@ class GRPOTrainer:
                         f"loss: {avg_loss:.4f} | "
                         f"kl: {avg_kl:.4f} | "
                         f"clipped: {avg_clipped_fraction:.3f} | "
+                        f"len: {avg_response_length:.1f} | "
                         f"lr: {current_lr:.2e} | "
                         f"reward: {avg_reward_mean:.3f} | "
-                        f"success: {avg_success_rate:.1%}"
+                        f"success: {avg_success_rate:.1%} | "
+                        f"entropy: {avg_entropy:.4f}"
                     )
                 
                 if kl_exceeded:
@@ -737,6 +760,7 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_siz
     total_reward = 0.0
     total_samples = 0
     success_count = 0
+    total_response_length = 0.0
     
     # Convert dataset to list if it's not already
     eval_samples = list(eval_dataset)
@@ -766,10 +790,15 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_siz
         generated_tokens = generated[:, prompt_length:]
         completions = [tokenizer.decode(gen, skip_special_tokens=True) for gen in generated_tokens]
         
+        # Calculate response lengths for the batch
+        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+        response_lengths = (generated_tokens != pad_token_id).sum(dim=1).float()
+        
         # Calculate rewards for the batch
         batch_rewards = math_reward_func(completions, batch_prompts)
         
         # Accumulate statistics
+        total_response_length += response_lengths.sum().item()
         for reward in batch_rewards:
             total_reward += reward
             total_samples += 1
@@ -779,10 +808,12 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_siz
     # Calculate metrics
     avg_reward = total_reward / total_samples if total_samples > 0 else 0.0
     success_rate = success_count / total_samples if total_samples > 0 else 0.0
+    avg_response_length = total_response_length / total_samples if total_samples > 0 else 0.0
     
     return {
         "eval_reward_mean": avg_reward,
         "eval_success_rate": success_rate,
+        "eval_avg_response_length": avg_response_length,
         "eval_samples": total_samples
     }
 
