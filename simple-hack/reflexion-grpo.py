@@ -38,6 +38,7 @@ class GRPOTrainer:
         total_steps: Optional[int] = None,
         lr_schedule: bool = True,
         min_lr_ratio: float = 0.1,
+        grad_clip_norm: Optional[float] = 1.0,
     ) -> None:
         self.model = model.to(device)
         self.ref_model = ref_model.to(device)
@@ -47,6 +48,7 @@ class GRPOTrainer:
         self.kl_coef = kl_coef
         self.device = device
         self.dr = dr
+        self.grad_clip_norm = grad_clip_norm
         
         # Learning rate scheduler setup
         self.lr_schedule = lr_schedule
@@ -63,6 +65,13 @@ class GRPOTrainer:
             print(f"Initial optimizer LR: {self.optimizer.param_groups[0]['lr']:.2e}")
         else:
             print(f"No LR scheduling - static LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Print gradient clipping configuration
+        if self.grad_clip_norm is not None:
+            print(f"Gradient clipping enabled with norm: {self.grad_clip_norm}")
+        else:
+            self.grad_clip_norm = float('inf')
+            print("Gradient clipping disabled")
 
     def _old_log_probs(self, logits: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         """Return log-probabilities of `actions` under the policy that produced `logits`."""
@@ -158,8 +167,13 @@ class GRPOTrainer:
         actions = actions.to(self.device)
         rewards = rewards.to(self.device)
 
+        # Construct an attention mask (1 for real tokens, 0 for PAD) so the model
+        # does not attend to padding on the left.  This fixes the unintended
+        # influence of pad tokens during both policy and reference forward passes.
+        attention_mask = (input_ids != pad_token_id).long()
+
         # Forward pass
-        outputs = self.model(input_ids)
+        outputs = self.model(input_ids, attention_mask=attention_mask)
         
         # Extract logits only for positions predicting generated tokens
         # We want logits[prompt_length-1:] to predict actions (generated tokens)
@@ -173,10 +187,10 @@ class GRPOTrainer:
             if hasattr(self.model, "disable_adapter"):
                 # LoRA or other PEFT model – disable adapters for a clean reference policy
                 with self.model.disable_adapter():  # type: ignore[attr-defined]
-                    ref_outputs = self.model(input_ids)
+                    ref_outputs = self.model(input_ids, attention_mask=attention_mask)
             else:
                 # Full-fine-tune setting – use the dedicated frozen reference model
-                ref_outputs = self.ref_model(input_ids)
+                ref_outputs = self.ref_model(input_ids, attention_mask=attention_mask)
 
             ref_logits = ref_outputs.logits[:, prompt_length-1:-1, :]
             ref_logp = self._old_log_probs(ref_logits, target_actions)
@@ -191,8 +205,9 @@ class GRPOTrainer:
         if self.dr:
             # Skip length normalization and std normalization when dr=True
             advantages = rewards.unsqueeze(-1).expand_as(old_logp)
-            advantages = advantages - advantages.mean()  # Only center, don't normalize std
+            # Not precisely DR GRPO anymore, but might make this a little easier to train and not a big difference.
             advantages = advantages / 1000 # scale down advantages according to approximate sequence length
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         else:
             # Apply full normalization (length + std) when dr=False
             seq_lengths = (target_actions != pad_token_id).sum(dim=1).float().clamp(min=1.0)  # Use actual pad token
@@ -273,6 +288,7 @@ class GRPOTrainer:
             wandb.log({
                 f"{eval_type}_eval/success_rate": metrics.get("eval_success_rate", 0),
                 f"{eval_type}_eval/reward_mean": metrics.get("eval_reward_mean", 0),
+                f"{eval_type}_eval/reward_std": metrics.get("eval_reward_std", 0),
                 f"{eval_type}_eval/avg_response_length": metrics.get("eval_avg_response_length", 0),
                 "episode": episode
             })
@@ -359,7 +375,8 @@ class GRPOTrainer:
                     self._disable_dropout()
                 
                 with torch.no_grad():
-                    outputs = self.model(input_ids.to(self.device))
+                    attn = (input_ids != pad_token_id).long().to(self.device)
+                    outputs = self.model(input_ids.to(self.device), attention_mask=attn)
                     logits = outputs.logits[:, prompt_length-1:-1, :]
                     target_actions = actions.to(self.device)
                     old_logp = self._old_log_probs(logits, target_actions)
@@ -437,7 +454,11 @@ class GRPOTrainer:
 
                     # Clip gradients and perform optimizer step after accumulating over the whole minibatch
                     total_optim_steps += 1
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    
+                    # Gradient Norm Calculation and Clipping. clip_grad_norm_ returns the total norm of
+                    # all parameters (viewed as a single vector) before clipping.
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm).item()
+
                     self.optimizer.step()
                     
                     # Capture LR before scheduler step for accurate logging
@@ -458,6 +479,7 @@ class GRPOTrainer:
                     minibatch_rewards = torch.cat([data['rewards'] for data in minibatch])
                     avg_reward_mean = minibatch_rewards.mean().item()
                     avg_reward_max = minibatch_rewards.max().item()
+                    avg_reward_std = minibatch_rewards.std().item()
                     avg_success_rate = (minibatch_rewards > 0).float().mean().item()
                     
                     if use_wandb:
@@ -470,8 +492,10 @@ class GRPOTrainer:
                             "train/learning_rate": current_lr,
                             "train/batch_reward_mean": avg_reward_mean,
                             "train/batch_reward_max": avg_reward_max,
+                            "train/batch_reward_std": avg_reward_std,
                             "train/batch_success_rate": avg_success_rate,
                             "train/model_entropy": avg_entropy,
+                            "train/grad_norm": grad_norm,
                             "step": total_optim_steps,
                             "collection_step": collection_step,
                             "epoch_per_batch": epoch + 1,
@@ -488,6 +512,8 @@ class GRPOTrainer:
                         f"len: {avg_response_length:.1f} | "
                         f"lr: {current_lr:.2e} | "
                         f"reward: {avg_reward_mean:.3f} | "
+                        f"reward_std: {avg_reward_std:.3f} | "
+                        f"grad_norm: {grad_norm:.4f} | "
                         f"success: {avg_success_rate:.1%} | "
                         f"entropy: {avg_entropy:.4f}"
                     )
@@ -540,6 +566,16 @@ def generate_with_cache(model, **kwargs):
     return generated_ids
 
 
+def _extract_completions(tokenizer, generated_ids: torch.Tensor, input_ids: torch.Tensor) -> List[str]:
+    """Decodes generated token sequences and extracts the completions by slicing the token tensors."""
+    # Slice the generated_ids tensor to get only the tokens that were generated after the prompt.
+    completion_ids = generated_ids[:, input_ids.shape[1]:]
+    
+    # Decode the completion tokens, skipping special tokens.
+    completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+    return completions
+
+
 def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapter=False, enable_thinking: bool = True, **gen_kwargs):
     """Generates completions from a model and decodes them."""
     
@@ -579,10 +615,8 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
     else:
         generated_ids = generate_with_cache(model, **base_gen_kwargs)
         
-    # Extract, decode, and return completions
-    prompt_length = tokenized["input_ids"].shape[1]
-    generated_tokens = generated_ids[:, prompt_length:]
-    completions = [tokenizer.decode(gen, skip_special_tokens=True) for gen in generated_tokens]
+    # Extract, decode, and return completions using the new token-based slicing method.
+    completions = _extract_completions(tokenizer, generated_ids, tokenized["input_ids"])
     
     return completions
 
@@ -761,6 +795,7 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_siz
     total_samples = 0
     success_count = 0
     total_response_length = 0.0
+    all_rewards = []
     
     # Convert dataset to list if it's not already
     eval_samples = list(eval_dataset)
@@ -785,10 +820,11 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_siz
             repetition_penalty=1.1
         )
         
-        # Extract only the generated parts and decode completions
-        prompt_length = inputs["input_ids"].shape[1]
-        generated_tokens = generated[:, prompt_length:]
-        completions = [tokenizer.decode(gen, skip_special_tokens=True) for gen in generated_tokens]
+        # Decode each generated sequence and extract the completion.
+        completions = _extract_completions(tokenizer, generated, inputs["input_ids"])
+        
+        # Re-tokenize completions to get token counts for length calculation
+        generated_tokens = tokenizer(completions, padding=True, return_tensors="pt")["input_ids"]
         
         # Calculate response lengths for the batch
         pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
@@ -796,6 +832,7 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_siz
         
         # Calculate rewards for the batch
         batch_rewards = math_reward_func(completions, batch_prompts)
+        all_rewards.extend(batch_rewards)
         
         # Accumulate statistics
         total_response_length += response_lengths.sum().item()
@@ -807,11 +844,13 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_siz
     
     # Calculate metrics
     avg_reward = total_reward / total_samples if total_samples > 0 else 0.0
+    reward_std = torch.tensor(all_rewards, dtype=torch.float32).std().item() if total_samples > 0 else 0.0
     success_rate = success_count / total_samples if total_samples > 0 else 0.0
     avg_response_length = total_response_length / total_samples if total_samples > 0 else 0.0
     
     return {
         "eval_reward_mean": avg_reward,
+        "eval_reward_std": reward_std,
         "eval_success_rate": success_rate,
         "eval_avg_response_length": avg_response_length,
         "eval_samples": total_samples
@@ -868,6 +907,9 @@ def main():
     # Learning rate scheduler configuration
     parser.add_argument("--lr_schedule", action="store_true", default=True, help="Use linear learning rate decay")
     parser.add_argument("--min_lr_ratio", type=float, default=0.1, help="Minimum learning rate as ratio of initial LR (default: 0.1 = 10% of initial LR)")
+    
+    # Gradient clipping configuration
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm. Set to 0 or negative to disable clipping")
 
     args = parser.parse_args()
 
@@ -944,6 +986,7 @@ def main():
         total_steps=total_optim_steps,
         lr_schedule=args.lr_schedule,
         min_lr_ratio=args.min_lr_ratio,
+        grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
     )
 
     print("Starting GRPO fine-tuning with math problems …")
