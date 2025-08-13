@@ -16,6 +16,11 @@ from datasets import Dataset
 # Import math problem generation and reward functions
 from functions import generate_math_problems, math_reward_func, parse_completion
 
+# Global token IDs - initialized in main() after tokenizer is loaded
+PAD_TOKEN_ID = None
+EOS_TOKEN_ID = None
+SEQUENCE_LENGTH_NORMALIZATION = 1000.0
+
 # ============================================================
 #   Generalized Reinforced Policy Optimization (GRPO)
 #   Minimal PyTorch implementation written from scratch so it
@@ -34,7 +39,6 @@ class GRPOTrainer:
         clip_ratio: float = 0.2,
         kl_coef: float = 0.01,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        dr: bool = True,
         total_steps: Optional[int] = None,
         lr_schedule: bool = True,
         min_lr_ratio: float = 0.1,
@@ -47,7 +51,6 @@ class GRPOTrainer:
         self.clip_ratio = clip_ratio
         self.kl_coef = kl_coef
         self.device = device
-        self.dr = dr
         self.grad_clip_norm = grad_clip_norm
         
         # Learning rate scheduler setup
@@ -83,9 +86,8 @@ class GRPOTrainer:
         new_logp: torch.Tensor,
         old_logp: torch.Tensor,
         advantages: torch.Tensor,
-        mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, float]:
-        """Computes the policy gradient loss component, ignoring padded tokens."""
+        """Computes the policy gradient loss component."""
         ratio = torch.exp(new_logp - old_logp)
         clipped_fraction = 0.0
         if self.clip_ratio > 0:
@@ -94,37 +96,25 @@ class GRPOTrainer:
             pg_loss2 = -(clipped_ratio * advantages)
             pg_losses = torch.max(pg_loss1, pg_loss2)
             
-            # Debug: policy gradient loss statistics before mean, using mask
-            # print(f"[DEBUG PG] pg_loss1: mean={pg_loss1[mask].mean().item():.4f}, std={pg_loss1[mask].std().item():.4f}, min={pg_loss1[mask].min().item():.4f}, max={pg_loss1[mask].max().item():.4f}")
-            # print(f"[DEBUG PG] pg_loss2: mean={pg_loss2[mask].mean().item():.4f}, std={pg_loss2[mask].std().item():.4f}, min={pg_loss2[mask].min().item():.4f}, max={pg_loss2[mask].max().item():.4f}")
-            # print(f"[DEBUG PG] final_pg_losses: mean={pg_losses[mask].mean().item():.4f}, std={pg_losses[mask].std().item():.4f}, min={pg_losses[mask].min().item():.4f}, max={pg_losses[mask].max().item():.4f}")
-            
-            # Count clipping statistics, using mask
+            # Count clipping statistics
             clipped_mask = (ratio < 1.0 - self.clip_ratio) | (ratio > 1.0 + self.clip_ratio)
-            clipped_fraction = clipped_mask[mask].float().mean().item()
-            print(f"[DEBUG PG] clipped_fraction: {clipped_fraction:.3f}")
+            clipped_fraction = clipped_mask.float().mean().item()
             
-            return pg_losses[mask].mean(), clipped_fraction
+            return pg_losses.mean(), clipped_fraction
         else:
             unclipped_losses = -(ratio * advantages)
-            return unclipped_losses[mask].mean(), clipped_fraction
+            return unclipped_losses.mean(), clipped_fraction
 
     def _kl_loss(
         self,
         new_logp: torch.Tensor,
         ref_logp: torch.Tensor,
-        mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Computes the KL divergence loss against the reference model, ignoring padded tokens."""
+        """Computes the KL divergence loss against the reference model."""
         log_ratio_ref = ref_logp - new_logp
         ratio_ref = torch.exp(log_ratio_ref)
         kl_losses = ratio_ref - log_ratio_ref - 1
-        
-        # Debug: KL loss statistics, using mask
-        # print(f"[DEBUG KL] log_ratio_ref: mean={log_ratio_ref[mask].mean().item():.4f}, std={log_ratio_ref[mask].std().item():.4f}, min={log_ratio_ref[mask].min().item():.4f}, max={log_ratio_ref[mask].max().item():.4f}")
-        # print(f"[DEBUG KL] kl_losses: mean={kl_losses[mask].mean().item():.4f}, std={kl_losses[mask].std().item():.4f}, min={kl_losses[mask].min().item():.4f}, max={kl_losses[mask].max().item():.4f}")
-        
-        return kl_losses[mask].mean()
+        return kl_losses.mean()
 
     def _disable_dropout(self):
         """Sets all dropout layers to eval mode."""
@@ -135,11 +125,10 @@ class GRPOTrainer:
     def compute_loss(
         self,
         input_ids: torch.Tensor,
-        actions: torch.Tensor,
-        rewards: torch.Tensor,
-        prompt_length: int,
-        pad_token_id: int,
-        old_logp: Optional[torch.Tensor] = None,
+        loss_mask: torch.Tensor,
+        old_logp: torch.Tensor,
+        advantages_per_sequence: torch.Tensor,
+        rollouts_per_prompt: int,
     ) -> Dict[str, Any]:
         """Compute the loss for a batch, but do not perform an optimization step.
         This is used for gradient accumulation.
@@ -147,92 +136,68 @@ class GRPOTrainer:
         Parameters
         ----------
         input_ids : (B, T) full sequence tokens (prompt + generated)
-        actions    : (B, G) generated tokens only
-        rewards    : (B,) scalar reward for each sequence
-        prompt_length : int, length of the prompt (same for all in batch)
-        pad_token_id : int, token ID used for padding
-        old_logp   : (B, G) old log probabilities for generated tokens only
+        loss_mask  : (B, T-1) mask indicating which tokens are part of the sequence to compute loss for
+        old_logp   : Old log probabilities. Either flattened to match masked positions or full (B, T-1) to be masked
+        advantages_per_sequence : (B,) single scalar advantage per sequence
+        rollouts_per_prompt : number of rollouts to normalize loss by
         """
         input_ids = input_ids.to(self.device)
-        actions = actions.to(self.device)
-        rewards = rewards.to(self.device)
+        loss_mask = loss_mask.to(self.device)
 
-        # Construct an attention mask (1 for real tokens, 0 for PAD) so the model
-        # does not attend to padding.
-        attention_mask = (input_ids != pad_token_id).long()
+        # Construct an attention mask (1 for real tokens, 0 for PAD)
+        attention_mask = (input_ids != PAD_TOKEN_ID).long()
 
-        # Forward pass
+        # Forward pass to get new logits
         outputs = self.model(input_ids, attention_mask=attention_mask)
+        logits = outputs.logits[:, :-1, :]  # Shape: (B, T-1, V)
         
-        # Extract logits only for positions predicting generated tokens
-        # We want logits[prompt_length-1:] to predict actions (generated tokens)
-        logits = outputs.logits[:, prompt_length-1:-1, :]  # positions predicting generated tokens
-        target_actions = actions  # actions are already just the generated tokens
+        # The "actions" for loss calculation are the input_ids shifted
+        target_actions = input_ids[:, 1:]
 
-        # Compute reference log-probs with LoRA adapters disabled to avoid parameter drift
-        # If the model is a PEFT/LoRA model, temporarily turn off the adapters; otherwise
-        # fall back to the separate frozen reference model.
+        # Compute reference log-probs
         with torch.no_grad():
             if hasattr(self.model, "disable_adapter"):
-                # LoRA or other PEFT model – disable adapters for a clean reference policy
-                with self.model.disable_adapter():  # type: ignore[attr-defined]
+                with self.model.disable_adapter():
                     ref_outputs = self.model(input_ids, attention_mask=attention_mask)
             else:
-                # Full-fine-tune setting – use the dedicated frozen reference model
                 ref_outputs = self.ref_model(input_ids, attention_mask=attention_mask)
 
-            ref_logits = ref_outputs.logits[:, prompt_length-1:-1, :]
-            ref_logp = self._old_log_probs(ref_logits, target_actions)
+            ref_logits = ref_outputs.logits[:, :-1, :]
+            ref_logp_full = self._old_log_probs(ref_logits, target_actions)
+            ref_logp = ref_logp_full[loss_mask] # Apply mask
 
-        # Compute old log-probabilities (detach from graph)
-        if old_logp is None:
-            old_logp = self._old_log_probs(logits.detach(), target_actions)
-        else:
-            old_logp = old_logp.to(self.device)
+        # Ensure provided old_logp is on device and aligned to masked positions
+        old_logp = old_logp.to(self.device)
+        # If provided as full (B, T-1), apply mask to flatten; if already 1D, leave as is
+        # Note that current code _indeed_ supplies a full (B, T-1) tensor, so we need to mask it.
+        if old_logp.dim() == 2:
+            old_logp = old_logp[loss_mask]
 
-        # Compute advantages with optional sequence length normalization
-        if self.dr:
-            # Skip length normalization when dr=True
-            advantages = rewards.unsqueeze(-1).expand_as(old_logp)
-            # Not precisely DR GRPO anymore, but might make this a little easier to train and not a big difference.
-            advantages = advantages / 1000 # Scale down advantages according to approximate sequence length. Note this doesn't really matter after normalization.
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        else:
-            # Apply full normalization (length + std) when dr=False
-            seq_lengths = (target_actions != pad_token_id).sum(dim=1).float().clamp(min=1.0)  # Use actual pad token
-            normalized_rewards = rewards / seq_lengths
-            advantages = normalized_rewards.unsqueeze(-1).expand_as(old_logp)
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Advantages are provided per-sequence; expand to per-token via repeat_interleave
+        seq_advantages = advantages_per_sequence.to(self.device)
+
+        # For each sequence, repeat its advantage for the number of generated tokens included in the loss
+        token_counts_per_sequence = loss_mask.sum(dim=1)
+        advantages = torch.repeat_interleave(seq_advantages, token_counts_per_sequence)
 
         # New log-probabilities for gradient flow
-        new_logp = self._old_log_probs(logits, target_actions)
+        new_logp_full = self._old_log_probs(logits, target_actions)
+        new_logp = new_logp_full[loss_mask] # Apply mask
 
-        # Create mask to ignore padding tokens in loss calculations.
-        # The mask should include all real tokens and the first pad/EOS token,
-        # but exclude all subsequent padding tokens.
-        is_pad = (target_actions == pad_token_id)
-
-        # The cumulative sum will be 0 for real tokens, 1 for the first pad
-        # token, and >1 for subsequent pad tokens. We keep everything <= 1.
-        mask = torch.cumsum(is_pad.to(torch.int), dim=1) <= 1
-
-        # Calculate model entropy over non-padded tokens for logging
+        # Calculate model entropy over the generated tokens for logging
         with torch.no_grad():
-            # Use the already-sampled actions to estimate entropy
-            # This is analogous to how we compute KL divergence using sampled log probs
-            estimated_entropy = -new_logp  # Entropy ≈ -E[log p(x)] where x ~ p
-            mean_entropy = estimated_entropy[mask].mean().item()
+            estimated_entropy = -new_logp
+            mean_entropy = estimated_entropy.mean().item()
 
         # Compute loss components
-        pg_loss, clipped_fraction = self._pg_loss(new_logp, old_logp, advantages, mask)
-        kl_loss = self._kl_loss(new_logp, ref_logp, mask)
-        loss = pg_loss + self.kl_coef * kl_loss
+        pg_loss, clipped_fraction = self._pg_loss(new_logp, old_logp, advantages)
+        kl_loss = self._kl_loss(new_logp, ref_logp)
+        loss = (pg_loss + self.kl_coef * kl_loss) / SEQUENCE_LENGTH_NORMALIZATION / float(rollouts_per_prompt)
 
-        response_lengths = (target_actions != pad_token_id).sum(dim=1).float()
-        avg_response_length = response_lengths.mean().item()
+        avg_response_length = loss_mask.sum().item() / loss_mask.shape[0]
 
         return {
-            "loss": loss,  # Return the loss tensor for backward pass
+            "loss": loss,
             "pg_loss": pg_loss.item(),
             "kl_loss": kl_loss.item(),
             "clipped_fraction": clipped_fraction,
@@ -288,6 +253,7 @@ class GRPOTrainer:
         batch_size: int,
         epochs_per_batch: int,
         rollouts_per_prompt: int,
+        prompts_per_generation: int,
         max_new_tokens: int,
         eval_dataset: Optional[Any] = None,
         use_wandb: bool = False,
@@ -337,7 +303,7 @@ class GRPOTrainer:
             step_success_rates = []
 
             print(f"\nCollecting experience for collection step {collection_step}/{collection_steps}...")
-            for micro_step in range(batch_size):
+            for micro_step in range(batch_size // prompts_per_generation):
                 # Sample a fresh batch for each accumulation step
                 if use_revision:
                     batch = sample_and_revise(
@@ -345,28 +311,43 @@ class GRPOTrainer:
                         tokenizer=tokenizer,
                         revision_model=self.model,
                         rollouts_per_prompt=rollouts_per_prompt,
+                        prompts_per_generation=prompts_per_generation,
                         max_new_tokens=max_new_tokens,
-                        pad=True,
                         disable_adapter=False,
                         enable_thinking=False
                     )
                 else:
-                    batch = sample(self.model, tokenizer, rollouts_per_prompt=rollouts_per_prompt, max_new_tokens=max_new_tokens)
+                    batch = sample(self.model, tokenizer, rollouts_per_prompt=rollouts_per_prompt, prompts_per_generation=prompts_per_generation, max_new_tokens=max_new_tokens)
                 
-                input_ids, actions, rewards, prompt_length, pad_token_id, _, _ = batch
+                input_ids, rewards, advantages, loss_mask, _, _ = batch
                 
                 with torch.no_grad():
-                    attn = (input_ids != pad_token_id).long().to(self.device)
+                    attn = (input_ids != PAD_TOKEN_ID).long().to(self.device)
                     outputs = self.model(input_ids.to(self.device), attention_mask=attn)
-                    logits = outputs.logits[:, prompt_length-1:-1, :]
-                    target_actions = actions.to(self.device)
+                    
+                    # Extract logits for the entire sequence, then mask them in the loss function
+                    logits = outputs.logits[:, :-1, :] 
+                    
+                    # The "actions" are just the input_ids shifted for prediction
+                    target_actions = input_ids[:, 1:].to(self.device)
+                    
                     old_logp = self._old_log_probs(logits, target_actions)
                 
-                experience_buffer.append({
-                    'input_ids': input_ids, 'actions': actions, 'rewards': rewards,
-                    'prompt_length': prompt_length, 'pad_token_id': pad_token_id,
-                    'old_logp': old_logp
-                })
+                # Split the tensors by prompt
+                input_ids_chunks = torch.split(input_ids, rollouts_per_prompt)
+                rewards_chunks = torch.split(rewards, rollouts_per_prompt)
+                advantages_chunks = torch.split(advantages, rollouts_per_prompt)
+                loss_mask_chunks = torch.split(loss_mask, rollouts_per_prompt)
+                old_logp_chunks = torch.split(old_logp, rollouts_per_prompt)
+
+                for i in range(prompts_per_generation):
+                    experience_buffer.append({
+                        'input_ids': input_ids_chunks[i], 
+                        'rewards': rewards_chunks[i],
+                        'advantages': advantages_chunks[i],
+                        'loss_mask': loss_mask_chunks[i],
+                        'old_logp': old_logp_chunks[i]
+                    })
                 
                 # Track and log rewards from this collection micro-batch
                 batch_reward_mean = rewards.mean().item()
@@ -374,7 +355,7 @@ class GRPOTrainer:
                 step_rewards_mean.append(batch_reward_mean)
                 step_rewards_max.append(rewards.max().item())
                 step_success_rates.append((rewards > 0).float().mean().item())
-                print(f"  Collected micro-batch {micro_step+1}/{batch_size} | reward: {batch_reward_mean:.3f}")
+                print(f"  Collected micro-batch {micro_step+1}/{batch_size // prompts_per_generation} | reward: {batch_reward_mean:.3f}")
             
             # --- 2. Optimization Phase ---
             kl_exceeded = False
@@ -399,22 +380,18 @@ class GRPOTrainer:
                         # Compute loss for the micro-batch using the pre-computed old_logp
                         metrics = self.compute_loss(
                             input_ids=micro_batch_data['input_ids'],
-                            actions=micro_batch_data['actions'],
-                            rewards=micro_batch_data['rewards'],
-                            prompt_length=micro_batch_data['prompt_length'],
-                            pad_token_id=micro_batch_data['pad_token_id'],
-                            old_logp=micro_batch_data['old_logp']
+                            loss_mask=micro_batch_data['loss_mask'],
+                            old_logp=micro_batch_data['old_logp'],
+                            advantages_per_sequence=micro_batch_data['advantages'],
+                            rollouts_per_prompt=rollouts_per_prompt,
                         )
                         loss = metrics['loss']
-                        
-                        # Normalize loss for accumulation across the minibatch
-                        loss = loss / len(minibatch)
                         
                         # Accumulate gradients
                         loss.backward()
 
                         # Store metrics for logging
-                        minibatch_losses.append(loss.item() * len(minibatch))
+                        minibatch_losses.append(loss.item())
                         minibatch_pg_losses.append(metrics['pg_loss'])
                         minibatch_kls.append(metrics['kl_loss'])
                         minibatch_clipped_fractions.append(metrics['clipped_fraction'])
@@ -554,6 +531,70 @@ def _extract_completions(tokenizer, generated_ids: torch.Tensor, input_ids: torc
     return completions
 
 
+def _create_loss_mask(prompt_len: int, seq_len: int, device: torch.device) -> torch.Tensor:
+    """Creates a boolean mask for the loss calculation.
+    
+    The mask is `True` for tokens that should be included in the loss (i.e., the generated tokens)
+    and `False` for tokens that should be excluded (i.e., the prompt tokens).
+
+    Parameters
+    ----------
+    prompt_len : int
+        The length of the prompt.
+    seq_len : int
+        The total length of the sequence (prompt + generated).
+    device : torch.device
+        The device to create the tensor on.
+
+    Returns
+    -------
+    torch.Tensor
+        A boolean tensor of shape (seq_len - 1,)
+    """
+    # The loss is calculated on logits, which have a sequence length of T-1.
+    # The mask should be True for all positions >= prompt_len - 1.
+    loss_mask = torch.arange(seq_len - 1, device=device) >= prompt_len - 1
+    return loss_mask
+
+
+def compute_sequence_advantages(rewards: torch.Tensor, prompts_per_generation: int, rollouts_per_prompt: int, eps: float = 1e-8) -> torch.Tensor:
+    """Compute simple per-sequence advantages by normalizing rewards.
+    Advantages are computed on a per-prompt basis.
+
+    advantages = (rewards - mean) / (std + eps)
+
+    Parameters
+    ----------
+    rewards : torch.Tensor
+        Tensor of shape (B,) with scalar rewards per sequence
+    prompts_per_generation : int
+        Number of unique prompts per generation
+    rollouts_per_prompt : int
+        Number of rollouts per prompt
+    eps : float
+        Small value to avoid division by zero
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor of shape (B,) with a single advantage per sequence
+    """
+    rewards = rewards.float()
+    
+    # Reshape rewards to (prompts_per_generation, rollouts_per_prompt)
+    rewards_per_prompt = rewards.view(prompts_per_generation, rollouts_per_prompt)
+    
+    # Compute mean and std per prompt
+    mean_per_prompt = rewards_per_prompt.mean(dim=1, keepdim=True)
+    std_per_prompt = rewards_per_prompt.std(dim=1, keepdim=True)
+    
+    # Normalize rewards per prompt
+    advantages_per_prompt = (rewards_per_prompt - mean_per_prompt) / (std_per_prompt + eps)
+    
+    # Flatten advantages back to (B,)
+    return advantages_per_prompt.view(-1)
+
+
 def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapter=False, enable_thinking: bool = True, **gen_kwargs):
     """Generates completions from a model and decodes them."""
     
@@ -578,10 +619,10 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
         "input_ids": tokenized["input_ids"].to(model.device),
         "attention_mask": tokenized["attention_mask"].to(model.device),
         "max_new_tokens": max_new_tokens,
-        "temperature": 0.7,
+        # "temperature": 0.7,
         "do_sample": True,
-        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
-        "repetition_penalty": 1.1,
+        "pad_token_id": PAD_TOKEN_ID,
+        # "repetition_penalty": 1.1,
     }
     # Update with any additional kwargs
     base_gen_kwargs.update(gen_kwargs)
@@ -592,88 +633,26 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
             generated_ids = generate_with_cache(model, **base_gen_kwargs)
     else:
         generated_ids = generate_with_cache(model, **base_gen_kwargs)
+
+    # Debug: Check for padding and EOS tokens in generated sequences
+    is_pad_tensor = (generated_ids == PAD_TOKEN_ID)
+    is_eos_tensor = (generated_ids == EOS_TOKEN_ID)
+    
+    torch.set_printoptions(threshold=10_000, linewidth=200)
+    print("Generated IDs shape:", generated_ids.shape)
+    print("Pad token ID:", PAD_TOKEN_ID)
+    print("EOS token ID:", EOS_TOKEN_ID)
+    print("is_pad_tensor (generated_ids == PAD_TOKEN_ID):")
+    print(is_pad_tensor)
+    print("is_eos_tensor (generated_ids == EOS_TOKEN_ID):")
+    print(is_eos_tensor)
+    print(tokenizer.batch_decode(generated_ids))
         
     # Extract, decode, and return completions using token-based slicing.
     completions = _extract_completions(tokenizer, generated_ids, tokenized["input_ids"])
     
-    return completions
-
-
-def _create_batch(prompts, completions, tokenizer, rollouts_per_prompt, pad):
-    """Create a micro-batch for the trainer from prompts and completions."""
-    rewards = torch.tensor(math_reward_func(completions, prompts), dtype=torch.float32)
-    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-    
-    # Get a consistent prompt length by padding
-    tokenized_prompts = tokenizer(prompts, padding=True, return_tensors="pt")
-    prompt_length = tokenized_prompts['input_ids'].shape[1]
-
-    # Tokenize completions and create full sequences
-    full_sequences = []
-    actions = []
-    
-    tokenized_prompts_list = tokenizer(prompts, padding=False, truncation=True)['input_ids']
-    tokenized_completions_list = tokenizer(completions, padding=False, truncation=True)['input_ids']
-
-    for i in range(rollouts_per_prompt):
-        prompt_toks = torch.tensor(tokenized_prompts_list[i], dtype=torch.long)
-        completion_toks = torch.tensor(tokenized_completions_list[i], dtype=torch.long)
-        
-        full_seq = torch.cat([prompt_toks, completion_toks])
-        full_sequences.append(full_seq)
-        actions.append(completion_toks)
-
-    if pad:
-        input_ids, actions = pad_sequences(full_sequences, actions, pad_token_id)
-    else:
-        input_ids = full_sequences
-        
-    return input_ids, actions, rewards, prompt_length, pad_token_id
-
-def _pad_and_stack_sequences(sequences: List[torch.Tensor], pad_token_id: int) -> torch.Tensor:
-    """Pad a list of sequences to their maximum length and stack them."""
-    max_len = max(seq.shape[0] for seq in sequences) if sequences else 0
-    
-    if not sequences:
-        return torch.empty((0, max_len), dtype=torch.long)
-
-    padded_sequences = []
-    for seq in sequences:
-        if seq.shape[0] < max_len:
-            padding = torch.full((max_len - seq.shape[0],), pad_token_id, dtype=torch.long)
-            padded_seq = torch.cat([seq, padding])
-        else:
-            padded_seq = seq[:max_len]
-        padded_sequences.append(padded_seq)
-        
-    return torch.stack(padded_sequences)
-
-
-def pad_sequences(
-    full_sequences: List[torch.Tensor], 
-    generated_tokens: List[torch.Tensor], 
-    pad_token_id: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pad sequences to same length for batch processing.
-    
-    Parameters
-    ----------
-    full_sequences : list of torch.Tensor
-        Full sequences (prompt + generated tokens)
-    generated_tokens : list of torch.Tensor
-        Generated tokens only
-    pad_token_id : int
-        Token ID to use for padding
-        
-    Returns
-    -------
-    tuple[torch.Tensor, torch.Tensor]
-        Padded input_ids and actions tensors
-    """
-    input_ids = _pad_and_stack_sequences(full_sequences, pad_token_id)
-    actions = _pad_and_stack_sequences(generated_tokens, pad_token_id)
-    
-    return input_ids, actions
+    # Return text completions, full generated sequence, and tokenized prompts
+    return completions, generated_ids, tokenized["input_ids"]
 
 
 def sample_and_revise(
@@ -681,8 +660,8 @@ def sample_and_revise(
     tokenizer, 
     revision_model,
     rollouts_per_prompt: int, 
+    prompts_per_generation: int,
     max_new_tokens: int, 
-    pad: bool, 
     disable_adapter: bool, 
     enable_thinking: bool
 ):
@@ -693,8 +672,8 @@ def sample_and_revise(
     3. Return the revised completions and their rewards.
     """
     # 1. First pass: Sample from the base model to get initial solutions
-    _, _, _, _, _, prompts, initial_completions = sample(
-        model, tokenizer, rollouts_per_prompt, max_new_tokens, pad=True
+    _, _, _, _, prompts, initial_completions = sample(
+        model, tokenizer, rollouts_per_prompt, prompts_per_generation, max_new_tokens
     )
 
     # 2. Second pass: Construct revision prompts and revise with the revision_model
@@ -716,7 +695,7 @@ The revised completion should be in the format: <think>chain-of-thought</think> 
         revision_prompts.append(revision_prompt)
     
     # Generate revised completions
-    revised_completions = generate_and_decode(
+    revised_completions, revised_generated_ids, revised_tokenized_input_ids = generate_and_decode(
         revision_model,
         tokenizer,
         revision_prompts,
@@ -733,102 +712,112 @@ The revised completion should be in the format: <think>chain-of-thought</think> 
         final_completions = revised_completions
     
     # Create the batch from prompts and generated completions
-    input_ids, actions, rewards, prompt_length, pad_token_id = _create_batch(
-        prompts, final_completions, tokenizer, rollouts_per_prompt, pad
-    )
+    rewards = torch.tensor(math_reward_func(final_completions, prompts), dtype=torch.float32)
+    advantages = compute_sequence_advantages(rewards, prompts_per_generation, rollouts_per_prompt)
+    prompt_length = revised_tokenized_input_ids.shape[1]
+    sequence_length = revised_generated_ids.shape[1]
+    input_ids = revised_generated_ids
+
+    # Create a loss mask for the revised sequence
+    loss_mask = _create_loss_mask(prompt_length, sequence_length, revised_generated_ids.device)
+    loss_mask = loss_mask.expand(revised_generated_ids.shape[0], -1)
     
-    return input_ids, actions, rewards, prompt_length, pad_token_id, prompts, final_completions
+    return input_ids, rewards, advantages, loss_mask, prompts, final_completions
 
 
-def sample(model, tokenizer, rollouts_per_prompt: int = 4, max_new_tokens: int = 512, pad: bool = True):
+def sample(model, tokenizer, rollouts_per_prompt: int = 4, prompts_per_generation: int = 1, max_new_tokens: int = 512):
     """Generate a batch of math problems and model completions for GRPO training."""
     
-    # Generate one math problem and use it for all batch elements
-    problem_generator = generate_math_problems(tokenizer, 1)
-    single_problem = next(problem_generator)
-    problems = [single_problem for _ in range(rollouts_per_prompt)]
+    # Generate `prompts_per_generation` unique math problems
+    problem_generator = generate_math_problems(tokenizer, prompts_per_generation)
+    unique_problems = list(problem_generator)
     
-    # Extract prompts (all the same now)
+    # Duplicate each problem `rollouts_per_prompt` times
+    problems = [problem for problem in unique_problems for _ in range(rollouts_per_prompt)]
+    
+    # Extract prompts
     prompts = [problem["prompt"] for problem in problems]
 
     # Generate completions using the model
-    completions = generate_and_decode(model, tokenizer, prompts, max_new_tokens, enable_thinking=True)
+    completions, generated_ids, tokenized_input_ids = generate_and_decode(model, tokenizer, prompts, max_new_tokens, enable_thinking=True)
     
     # Create the batch from prompts and generated completions
-    input_ids, actions, rewards, prompt_length, pad_token_id = _create_batch(
-        prompts, completions, tokenizer, rollouts_per_prompt, pad
-    )
+    rewards = torch.tensor(math_reward_func(completions, prompts), dtype=torch.float32)
+    advantages = compute_sequence_advantages(rewards, prompts_per_generation, rollouts_per_prompt)
+    prompt_length = tokenized_input_ids.shape[1]
+    sequence_length = generated_ids.shape[1]
     
-    return input_ids, actions, rewards, prompt_length, pad_token_id, prompts, completions
+    # Create a loss mask that is True for generated tokens and False for prompt tokens.
+    loss_mask = _create_loss_mask(prompt_length, sequence_length, generated_ids.device)
+    loss_mask = loss_mask.expand(generated_ids.shape[0], -1)
+
+    input_ids = generated_ids
+
+    return input_ids, rewards, advantages, loss_mask, prompts, completions
 
 
 def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_size=12):
-    """Batched evaluation function that generates completions and calculates rewards."""
-    
+    """Batched evaluation that uses the same chat templating and generation path as training."""
+
     model.eval()
     total_reward = 0.0
     total_samples = 0
     success_count = 0
     total_response_length = 0.0
     all_rewards = []
-    
+
     # Convert dataset to list if it's not already
     eval_samples = list(eval_dataset)
-    
+
     # Process evaluation dataset in batches
     for i in range(0, len(eval_samples), batch_size):
-        batch_samples = eval_samples[i:i+batch_size]
+        batch_samples = eval_samples[i:i + batch_size]
         batch_prompts = [sample["query"] for sample in batch_samples]
-        
-        # Tokenize the batch of prompts
-        inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True)
-        
-        # Generate completions for the batch
-        generated = generate_with_cache(
+
+        # Use the unified generation path (with chat template) for consistency
+        completions, generated_ids, tokenized_input_ids = generate_and_decode(
             model,
-            input_ids=inputs["input_ids"].to(model.device),
-            attention_mask=inputs["attention_mask"].to(model.device),
-            max_new_tokens=max_new_tokens,
-            temperature=0.7,
-            do_sample=True,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-            repetition_penalty=1.1
+            tokenizer,
+            batch_prompts,
+            max_new_tokens,
+            enable_thinking=True,
         )
-        
-        # Decode each generated sequence and extract the completion.
-        completions = _extract_completions(tokenizer, generated, inputs["input_ids"])
-        
-        # Re-tokenize completions to get token counts for length calculation
-        generated_tokens = tokenizer(completions, padding=True, return_tensors="pt")["input_ids"]
-        
-        # Calculate response lengths for the batch
-        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-        response_lengths = (generated_tokens != pad_token_id).sum(dim=1).float()
-        
+
+        # Compute response lengths directly from token ids
+        prompt_lengths = (tokenized_input_ids != PAD_TOKEN_ID).sum(dim=1)
+        batch_response_lengths = []
+        for row_idx in range(generated_ids.size(0)):
+            prompt_len = prompt_lengths[row_idx].item()
+            response_ids = generated_ids[row_idx, prompt_len:]
+            response_len = (response_ids != PAD_TOKEN_ID).sum().item()
+            batch_response_lengths.append(response_len)
+
         # Calculate rewards for the batch
         batch_rewards = math_reward_func(completions, batch_prompts)
         all_rewards.extend(batch_rewards)
-        
+
         # Accumulate statistics
-        total_response_length += response_lengths.sum().item()
+        total_response_length += float(sum(batch_response_lengths))
         for reward in batch_rewards:
             total_reward += reward
             total_samples += 1
             if reward > 0:
                 success_count += 1
-    
+
     # Calculate metrics
     avg_reward = total_reward / total_samples if total_samples > 0 else 0.0
-    reward_std = torch.tensor(all_rewards, dtype=torch.float32).std().item() if total_samples > 0 else 0.0
+    reward_std = (
+        torch.tensor(all_rewards, dtype=torch.float32).std().item() if total_samples > 0 else 0.0
+    )
     success_rate = success_count / total_samples if total_samples > 0 else 0.0
     avg_response_length = total_response_length / total_samples if total_samples > 0 else 0.0
-    
+
     return {
         "eval_reward_mean": avg_reward,
         "eval_reward_std": reward_std,
         "eval_success_rate": success_rate,
         "eval_avg_response_length": avg_response_length,
-        "eval_samples": total_samples
+        "eval_samples": total_samples,
     }
 
 
@@ -848,6 +837,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--steps", type=int, default=40, help="Total number of optimization steps.")
     parser.add_argument("--rollouts_per_prompt", type=int, default=8, help="Number of rollouts per prompt.")
+    parser.add_argument("--prompts_per_generation", type=int, default=1, help="Number of unique prompts for each generation step.")
     parser.add_argument("--clip_ratio", type=float, default=0.2, help="PPO-style clip ratio")
     parser.add_argument("--kl_coef", type=float, default=0.01, help="KL penalty coefficient")
     parser.add_argument("--max_new_tokens", type=int, default=1200, help="Maximum new tokens to generate")
@@ -869,10 +859,7 @@ def main():
     parser.add_argument("--wandb_project", type=str, default="grpo-math-training", help="W&B project name")
     parser.add_argument("--wandb_run_name", type=str, default="custom-grpo", help="W&B run name")
     parser.add_argument("--eval_size", type=int, default=10, help="Number of problems for evaluation")
-    
-    # Reward normalization configuration
-    parser.add_argument("--dr", action="store_true", default=True, help="Disable reward normalization (skip length normalization and std division)")
-    
+        
     # KL threshold configuration
     parser.add_argument("--kl_threshold", type=float, default=10, help="KL divergence threshold for early stopping")
     
@@ -899,20 +886,25 @@ def main():
     # Load model & tokenizer (trust_remote_code required for Qwen series)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
 
-    # Pad token for Qwen3-1.7B is <|endoftext|>
-    # EOS token is <|im_end|> = 151645` `
+    # Pad token for Qwen3-1.7B is <|endoftext|> = 151643
+    # EOS token is <|im_end|> = 151645
+    # Therefore this conditional does not execute on Qwen3-1.7B (presumably all Qwen3 models).
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Set padding side to 'left' for decoder-only models
-    tokenizer.padding_side = 'left'
+    global PAD_TOKEN_ID
+    PAD_TOKEN_ID = tokenizer.pad_token_id
+    global EOS_TOKEN_ID
+    EOS_TOKEN_ID = tokenizer.eos_token_id
+
+    print(f"Tokenizer pad token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
+    print(f"Tokenizer EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
     
     config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
     base_model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         config=config,
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
         trust_remote_code=True,
     )
 
@@ -960,7 +952,6 @@ def main():
         lr=args.lr,
         clip_ratio=args.clip_ratio,
         kl_coef=args.kl_coef,
-        dr=args.dr,
         total_steps=total_optim_steps,
         lr_schedule=args.lr_schedule,
         min_lr_ratio=args.min_lr_ratio,
@@ -995,6 +986,7 @@ def main():
         batch_size=args.batch_size,
         epochs_per_batch=args.epochs_per_batch,
         rollouts_per_prompt=args.rollouts_per_prompt,
+        prompts_per_generation=args.prompts_per_generation,
         max_new_tokens=args.max_new_tokens,
         eval_dataset=eval_dataset,
         use_wandb=args.use_wandb,
