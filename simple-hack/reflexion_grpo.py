@@ -1,6 +1,7 @@
 import argparse
 import math
 import random
+import time
 from typing import List, Dict, Any, Optional, Tuple
 import copy
 
@@ -94,9 +95,10 @@ class GRPOTrainer:
         attention_mask = (input_ids != PAD_TOKEN_ID).long()
         target_actions = input_ids[:, 1:]
 
-        if disable_adapter and hasattr(model, "disable_adapter"):
-            with model.disable_adapter():
-                outputs = model(input_ids, attention_mask=attention_mask)
+        # We must actually disable the adapter on self.model, ignoring the reference model.
+        if disable_adapter and hasattr(self.model, "disable_adapter"):
+            with self.model.disable_adapter():
+                outputs = self.model(input_ids, attention_mask=attention_mask)
         else:
             outputs = model(input_ids, attention_mask=attention_mask)
         
@@ -139,7 +141,7 @@ class GRPOTrainer:
         log_ratio_ref = ref_logp - new_logp
         ratio_ref = torch.exp(log_ratio_ref)
         kl_losses = ratio_ref - log_ratio_ref - 1
-        return kl_losses.sum()
+        return kl_losses
 
     def compute_loss(
         self,
@@ -168,6 +170,9 @@ class GRPOTrainer:
         # print(f"  loss_mask: {loss_mask.shape}")
         # print(f"  old_logp_full: {old_logp_full.shape}")
         # print(f"  advantages_per_sequence: {advantages_per_sequence.shape}")
+
+        # Debug: Print advantages
+        print(f"advantages_per_sequence: {advantages_per_sequence}")
 
         input_ids = input_ids.to(self.device)
         loss_mask = loss_mask.to(self.device)
@@ -198,31 +203,35 @@ class GRPOTrainer:
 
         # Calculate model entropy over the generated tokens for logging
         with torch.no_grad():
-            estimated_entropy = -new_logp
+            estimated_entropy = -new_logp.detach()
             mean_entropy = estimated_entropy.mean().item()
 
         # Compute loss components
         pg_loss, clipped_fraction = self._pg_loss(new_logp, old_logp, advantages)
 
-        # Debug: Check if new_logp equals old_logp
-        logp_equal = torch.allclose(new_logp, old_logp, atol=1e-6)
-        print(f"new_logp equals old_logp: {logp_equal}")
+        # # Debug: Check if new_logp equals ref_logp
+        # logp_equal = torch.allclose(new_logp, ref_logp, atol=1e-6)
+        # print(f"new_logp equals ref_logp: {logp_equal}")
+
+        # # Debug: Check if new_logp equals old_logp
+        # logp_equal = torch.allclose(new_logp, old_logp, atol=1e-6)
+        # print(f"new_logp equals old_logp: {logp_equal}")
         
-        # If this is the first step and logp tensors don't agree, print them
-        if is_first_step and not logp_equal:
-            print(f"First step - old_logp and new_logp do not agree:")
-            print(f"old_logp: {old_logp}")
-            print(f"new_logp: {new_logp}")
+        # # If this is the first step and logp tensors don't agree, print them
+        # if is_first_step and not logp_equal:
+        #     print(f"First step - old_logp and new_logp do not agree:")
+        #     print(f"old_logp: {old_logp}")
+        #     print(f"new_logp: {new_logp}")
 
         kl_loss = self._kl_loss(new_logp, ref_logp)
-        loss = (pg_loss + self.kl_coef * kl_loss) / SEQUENCE_LENGTH_NORMALIZATION / float(rollouts_per_prompt)
+        loss = (pg_loss + self.kl_coef * kl_loss.sum()) / SEQUENCE_LENGTH_NORMALIZATION / float(rollouts_per_prompt)
 
         avg_response_length = loss_mask.sum().item() / loss_mask.shape[0]
 
         return {
             "loss": loss,
             "pg_loss": pg_loss.item(),
-            "kl_loss": kl_loss.item() / SEQUENCE_LENGTH_NORMALIZATION / float(rollouts_per_prompt),
+            "kl_loss": kl_loss.mean().item(),
             "clipped_fraction": clipped_fraction,
             "avg_response_length": avg_response_length,
             "model_entropy": mean_entropy,
@@ -327,6 +336,7 @@ class GRPOTrainer:
             for micro_step in range(batch_size // prompts_per_generation):
                 # Sample a fresh batch for each accumulation step
                 if use_revision:
+                    sample_start_time = time.time()
                     batch = sample_and_revise(
                         model=self.model,
                         tokenizer=tokenizer,
@@ -337,8 +347,13 @@ class GRPOTrainer:
                         disable_adapter=False,
                         enable_thinking=False
                     )
+                    sample_time = time.time() - sample_start_time
+                    print(f"  sample_and_revise took {sample_time:.2f}s")
                 else:
+                    sample_start_time = time.time()
                     batch = sample(self.model, tokenizer, rollouts_per_prompt=rollouts_per_prompt, prompts_per_generation=prompts_per_generation, max_new_tokens=max_new_tokens)
+                    sample_time = time.time() - sample_start_time
+                    print(f"  sample took {sample_time:.2f}s")
                 
                 input_ids, rewards, advantages, loss_mask, _, _ = batch
 
@@ -357,7 +372,7 @@ class GRPOTrainer:
                         'rewards': rewards_chunks[i],
                         'advantages': advantages_chunks[i],
                         'loss_mask': loss_mask_chunks[i],
-                        'old_logp_full': chunk_logp
+                        'old_logp_full': chunk_logp.detach()
                     })
                 
                 # Track and log rewards from this collection micro-batch
@@ -368,6 +383,10 @@ class GRPOTrainer:
                 step_success_rates.append((rewards > 0).float().mean().item())
                 print(f"  Collected micro-batch {micro_step+1}/{batch_size // prompts_per_generation} | reward: {batch_reward_mean:.3f}")
             
+            # Clear GPU cache after all experience collection is complete
+            print("Clearing GPU cache after experience collection...")
+            torch.cuda.empty_cache()
+
             # --- 2. Optimization Phase ---
             self.model.train()
             kl_exceeded = False
@@ -399,6 +418,7 @@ class GRPOTrainer:
                         # )
 
                         # Compute loss for the micro-batch using the pre-computed old_logp
+                        compute_loss_start_time = time.time()
                         metrics = self.compute_loss(
                             input_ids=micro_batch_data['input_ids'],
                             loss_mask=micro_batch_data['loss_mask'],
@@ -407,6 +427,8 @@ class GRPOTrainer:
                             rollouts_per_prompt=rollouts_per_prompt,
                             is_first_step=is_first_gradient_step,
                         )
+                        compute_loss_time = time.time() - compute_loss_start_time
+                        print(f"    compute_loss took {compute_loss_time:.3f}s")
                         loss = metrics['loss']
                         
                         # Accumulate gradients
@@ -1032,6 +1054,12 @@ def main():
 
     print(f"Tokenizer pad token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
     print(f"Tokenizer EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
+
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        print(f"Current CUDA device: {torch.cuda.current_device()}")
+        print(f"CUDA device name: {torch.cuda.get_device_name()}")
     
     config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
     base_model = AutoModelForCausalLM.from_pretrained(
