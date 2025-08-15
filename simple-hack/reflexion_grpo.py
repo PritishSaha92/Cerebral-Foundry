@@ -77,10 +77,34 @@ class GRPOTrainer:
             self.grad_clip_norm = float('inf')
             print("Gradient clipping disabled")
 
-    def _old_log_probs(self, logits: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """Return log-probabilities of `actions` under the policy that produced `logits`."""
+    def _compute_log_probs(self, model: torch.nn.Module, input_ids: torch.Tensor, disable_adapter: bool = False) -> torch.Tensor:
+        """Computes log probabilities for a given model and input_ids.
+
+        Args:
+            model: The model to be used for computation.
+            input_ids: The input tensor for the model of shape (batch_size, sequence_length).
+            disable_adapter: A boolean flag to disable the adapter if it exists.
+        
+        Returns:
+            A tensor of log probabilities of shape (batch_size, sequence_length - 1).
+        """
+        was_training = model.training
+        model.eval()
+        input_ids = input_ids.to(self.device)
+        attention_mask = (input_ids != PAD_TOKEN_ID).long()
+        target_actions = input_ids[:, 1:]
+
+        if disable_adapter and hasattr(model, "disable_adapter"):
+            with model.disable_adapter():
+                outputs = model(input_ids, attention_mask=attention_mask)
+        else:
+            outputs = model(input_ids, attention_mask=attention_mask)
+        
+        logits = outputs.logits[:, :-1, :]
         log_probs = F.log_softmax(logits, dim=-1)
-        return log_probs.gather(-1, actions.unsqueeze(-1)).squeeze(-1)
+        if was_training:
+            model.train()
+        return log_probs.gather(-1, target_actions.unsqueeze(-1)).squeeze(-1)
 
     def _pg_loss(
         self,
@@ -101,10 +125,10 @@ class GRPOTrainer:
             clipped_mask = (ratio < 1.0 - self.clip_ratio) | (ratio > 1.0 + self.clip_ratio)
             clipped_fraction = clipped_mask.float().mean().item()
             
-            return pg_losses.mean(), clipped_fraction
+            return pg_losses.sum(), clipped_fraction
         else:
             unclipped_losses = -(ratio * advantages)
-            return unclipped_losses.mean(), clipped_fraction
+            return unclipped_losses.sum(), clipped_fraction
 
     def _kl_loss(
         self,
@@ -115,13 +139,7 @@ class GRPOTrainer:
         log_ratio_ref = ref_logp - new_logp
         ratio_ref = torch.exp(log_ratio_ref)
         kl_losses = ratio_ref - log_ratio_ref - 1
-        return kl_losses.mean()
-
-    def _disable_dropout(self):
-        """Sets all dropout layers to eval mode."""
-        for m in self.model.modules():
-            if isinstance(m, torch.nn.Dropout):
-                m.eval()
+        return kl_losses.sum()
 
     def compute_loss(
         self,
@@ -130,6 +148,7 @@ class GRPOTrainer:
         old_logp_full: torch.Tensor,
         advantages_per_sequence: torch.Tensor,
         rollouts_per_prompt: int,
+        is_first_step: bool = False,
     ) -> Dict[str, Any]:
         """Compute the loss for a batch, but do not perform an optimization step.
         This is used for gradient accumulation.
@@ -142,30 +161,25 @@ class GRPOTrainer:
         advantages_per_sequence : (B,) single scalar advantage per sequence
         rollouts_per_prompt : number of rollouts to normalize loss by
         """
+
+        # # Debug: Print shapes of input tensors
+        # print(f"Debug - Input tensor shapes:")
+        # print(f"  input_ids: {input_ids.shape}")
+        # print(f"  loss_mask: {loss_mask.shape}")
+        # print(f"  old_logp_full: {old_logp_full.shape}")
+        # print(f"  advantages_per_sequence: {advantages_per_sequence.shape}")
+
         input_ids = input_ids.to(self.device)
         loss_mask = loss_mask.to(self.device)
 
-        # Construct an attention mask (1 for real tokens, 0 for PAD)
-        attention_mask = (input_ids != PAD_TOKEN_ID).long()
-
-        # Forward pass to get new logits
-        outputs = self.model(input_ids, attention_mask=attention_mask)
-        logits = outputs.logits[:, :-1, :]  # Shape: (B, T-1, V)
-        
-        # The "actions" for loss calculation are the input_ids shifted
-        target_actions = input_ids[:, 1:]
-
         # Compute reference log-probs
         with torch.no_grad():
-            if hasattr(self.model, "disable_adapter"):
-                with self.model.disable_adapter():
-                    ref_outputs = self.model(input_ids, attention_mask=attention_mask)
-            else:
-                ref_outputs = self.ref_model(input_ids, attention_mask=attention_mask)
-
-            ref_logits = ref_outputs.logits[:, :-1, :]
-            ref_logp_full = self._old_log_probs(ref_logits, target_actions)
-            ref_logp = ref_logp_full[loss_mask] # Apply mask
+            ref_logp_full = self._compute_log_probs(
+                model=self.ref_model,
+                input_ids=input_ids,
+                disable_adapter=True,
+            )
+            ref_logp = ref_logp_full[loss_mask]
 
         # Compute old log-probs from full distribution
         old_logp_full = old_logp_full.to(self.device)
@@ -177,9 +191,9 @@ class GRPOTrainer:
         # For each sequence, repeat its advantage for the number of generated tokens included in the loss
         token_counts_per_sequence = loss_mask.sum(dim=1)
         advantages = torch.repeat_interleave(seq_advantages, token_counts_per_sequence)
-
+        
         # New log-probabilities for gradient flow
-        new_logp_full = self._old_log_probs(logits, target_actions)
+        new_logp_full = self._compute_log_probs(self.model, input_ids)
         new_logp = new_logp_full[loss_mask] # Apply mask
 
         # Calculate model entropy over the generated tokens for logging
@@ -189,6 +203,17 @@ class GRPOTrainer:
 
         # Compute loss components
         pg_loss, clipped_fraction = self._pg_loss(new_logp, old_logp, advantages)
+
+        # Debug: Check if new_logp equals old_logp
+        logp_equal = torch.allclose(new_logp, old_logp, atol=1e-6)
+        print(f"new_logp equals old_logp: {logp_equal}")
+        
+        # If this is the first step and logp tensors don't agree, print them
+        if is_first_step and not logp_equal:
+            print(f"First step - old_logp and new_logp do not agree:")
+            print(f"old_logp: {old_logp}")
+            print(f"new_logp: {new_logp}")
+
         kl_loss = self._kl_loss(new_logp, ref_logp)
         loss = (pg_loss + self.kl_coef * kl_loss) / SEQUENCE_LENGTH_NORMALIZATION / float(rollouts_per_prompt)
 
@@ -197,7 +222,7 @@ class GRPOTrainer:
         return {
             "loss": loss,
             "pg_loss": pg_loss.item(),
-            "kl_loss": kl_loss.item(),
+            "kl_loss": kl_loss.item() / SEQUENCE_LENGTH_NORMALIZATION / float(rollouts_per_prompt),
             "clipped_fraction": clipped_fraction,
             "avg_response_length": avg_response_length,
             "model_entropy": mean_entropy,
@@ -287,9 +312,6 @@ class GRPOTrainer:
             initial_metrics = self._run_evaluation(eval_dataset, tokenizer, max_new_tokens, "initial", 0, use_wandb)
 
         print("Starting GRPO training...")
-        # Set the model back to train mode for training
-        self.model.train()
-        self._disable_dropout()
         
         # Main training loop (steps are now data collection cycles)
         for collection_step in range(1, collection_steps + 1):
@@ -301,6 +323,7 @@ class GRPOTrainer:
             step_success_rates = []
 
             print(f"\nCollecting experience for collection step {collection_step}/{collection_steps}...")
+            self.model.eval()
             for micro_step in range(batch_size // prompts_per_generation):
                 # Sample a fresh batch for each accumulation step
                 if use_revision:
@@ -317,34 +340,24 @@ class GRPOTrainer:
                 else:
                     batch = sample(self.model, tokenizer, rollouts_per_prompt=rollouts_per_prompt, prompts_per_generation=prompts_per_generation, max_new_tokens=max_new_tokens)
                 
-                input_ids, rewards, advantages, loss_mask, prompts, final_completions = batch
-                
-                with torch.no_grad():
-                    attn = (input_ids != PAD_TOKEN_ID).long().to(self.device)
-                    outputs = self.model(input_ids.to(self.device), attention_mask=attn)
-                    
-                    # Extract logits for the entire sequence, then mask them in the loss function
-                    logits = outputs.logits[:, :-1, :] 
-                    
-                    # The "actions" are just the input_ids shifted for prediction
-                    target_actions = input_ids[:, 1:].to(self.device)
-                    
-                    old_logp_full = self._old_log_probs(logits, target_actions)
-                
-                # Split the tensors by prompt
+                input_ids, rewards, advantages, loss_mask, _, _ = batch
+
+                # Split tensors
                 input_ids_chunks = torch.split(input_ids, rollouts_per_prompt)
                 rewards_chunks = torch.split(rewards, rollouts_per_prompt)
                 advantages_chunks = torch.split(advantages, rollouts_per_prompt)
                 loss_mask_chunks = torch.split(loss_mask, rollouts_per_prompt)
-                old_logp_full_chunks = torch.split(old_logp_full, rollouts_per_prompt)
 
                 for i in range(prompts_per_generation):
+                    with torch.no_grad():
+                        chunk_logp = self._compute_log_probs(self.model, input_ids_chunks[i])
+
                     experience_buffer.append({
                         'input_ids': input_ids_chunks[i], 
                         'rewards': rewards_chunks[i],
                         'advantages': advantages_chunks[i],
                         'loss_mask': loss_mask_chunks[i],
-                        'old_logp_full': old_logp_full_chunks[i]
+                        'old_logp_full': chunk_logp
                     })
                 
                 # Track and log rewards from this collection micro-batch
@@ -356,7 +369,9 @@ class GRPOTrainer:
                 print(f"  Collected micro-batch {micro_step+1}/{batch_size // prompts_per_generation} | reward: {batch_reward_mean:.3f}")
             
             # --- 2. Optimization Phase ---
+            self.model.train()
             kl_exceeded = False
+            is_first_gradient_step = True
             for epoch in range(epochs_per_batch):
                 random.shuffle(experience_buffer)  # Shuffle experience for each epoch
                 
@@ -390,6 +405,7 @@ class GRPOTrainer:
                             old_logp_full=micro_batch_data['old_logp_full'],
                             advantages_per_sequence=micro_batch_data['advantages'],
                             rollouts_per_prompt=rollouts_per_prompt,
+                            is_first_step=is_first_gradient_step,
                         )
                         loss = metrics['loss']
                         
@@ -421,6 +437,9 @@ class GRPOTrainer:
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm).item()
 
                     self.optimizer.step()
+                    
+                    # After the first optimizer step, set the flag to False
+                    is_first_gradient_step = False
                     
                     # Capture LR before scheduler step for accurate logging
                     current_lr = self.optimizer.param_groups[0]['lr']
@@ -657,10 +676,10 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
         "input_ids": tokenized["input_ids"].to(model.device),
         "attention_mask": tokenized["attention_mask"].to(model.device),
         "max_new_tokens": max_new_tokens,
-        # "temperature": 0.7,
+        "temperature": 0.6,
         "do_sample": True,
         "pad_token_id": PAD_TOKEN_ID,
-        # "repetition_penalty": 1.1,
+        "repetition_penalty": 1.1,
     }
     # Update with any additional kwargs
     base_gen_kwargs.update(gen_kwargs)
@@ -936,6 +955,9 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_siz
 
 
 def main():
+    # Set print options to print full tensors
+    torch.set_printoptions(threshold=10_000, linewidth=200)
+
     parser = argparse.ArgumentParser(description="GRPO fine-tuning for Qwen3-1.7B on 24-game math problems")
     parser.add_argument(
         "--model_name",
@@ -958,7 +980,7 @@ def main():
     parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA for parameter-efficient fine-tuning")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha scaling parameter")
-    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout")
+    parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout")
     
     # Memory optimization
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing to save memory")
