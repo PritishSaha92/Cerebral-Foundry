@@ -89,8 +89,6 @@ class GRPOTrainer:
         Returns:
             A tensor of log probabilities of shape (batch_size, sequence_length - 1).
         """
-        was_training = model.training
-        model.eval()
         input_ids = input_ids.to(self.device)
         attention_mask = (input_ids != PAD_TOKEN_ID).long()
         target_actions = input_ids[:, 1:]
@@ -98,14 +96,14 @@ class GRPOTrainer:
         # We must actually disable the adapter on self.model, ignoring the reference model.
         if disable_adapter and hasattr(self.model, "disable_adapter"):
             with self.model.disable_adapter():
+                self._disable_dropout(self.model)
                 outputs = self.model(input_ids, attention_mask=attention_mask)
         else:
+            self._disable_dropout(self.model)
             outputs = model(input_ids, attention_mask=attention_mask)
         
         logits = outputs.logits[:, :-1, :]
         log_probs = F.log_softmax(logits, dim=-1)
-        if was_training:
-            model.train()
         return log_probs.gather(-1, target_actions.unsqueeze(-1)).squeeze(-1)
 
     def _pg_loss(
@@ -143,6 +141,12 @@ class GRPOTrainer:
         kl_losses = ratio_ref - log_ratio_ref - 1
         return kl_losses
 
+    def _disable_dropout(self, model):
+        """Sets all dropout layers to eval mode for the given model."""
+        for m in model.modules():
+            if isinstance(m, torch.nn.Dropout):
+                m.eval()
+
     def compute_loss(
         self,
         input_ids: torch.Tensor,
@@ -172,7 +176,7 @@ class GRPOTrainer:
         # print(f"  advantages_per_sequence: {advantages_per_sequence.shape}")
 
         # Debug: Print advantages
-        print(f"advantages_per_sequence: {advantages_per_sequence}")
+        # print(f"advantages_per_sequence: {advantages_per_sequence}")
 
         input_ids = input_ids.to(self.device)
         loss_mask = loss_mask.to(self.device)
@@ -326,6 +330,7 @@ class GRPOTrainer:
         for collection_step in range(1, collection_steps + 1):
             
             # --- 1. Data Collection Phase ---
+            collection_start_time = time.time()
             experience_buffer = []
             step_rewards_mean = []
             step_rewards_max = []
@@ -368,11 +373,11 @@ class GRPOTrainer:
                         chunk_logp = self._compute_log_probs(self.model, input_ids_chunks[i])
 
                     experience_buffer.append({
-                        'input_ids': input_ids_chunks[i], 
-                        'rewards': rewards_chunks[i],
-                        'advantages': advantages_chunks[i],
-                        'loss_mask': loss_mask_chunks[i],
-                        'old_logp_full': chunk_logp.detach()
+                        'input_ids': input_ids_chunks[i].to('cpu'), 
+                        'rewards': rewards_chunks[i].to('cpu'),
+                        'advantages': advantages_chunks[i].to('cpu'),
+                        'loss_mask': loss_mask_chunks[i].to('cpu'),
+                        'old_logp_full': chunk_logp.detach().to('cpu')
                     })
                 
                 # Track and log rewards from this collection micro-batch
@@ -387,7 +392,13 @@ class GRPOTrainer:
             print("Clearing GPU cache after experience collection...")
             torch.cuda.empty_cache()
 
+            collection_time = time.time() - collection_start_time
+            print(f"Data collection for step {collection_step} took {collection_time:.2f}s")
+            if use_wandb:
+                wandb.log({"train/data_collection_time": collection_time, "collection_step": collection_step})
+
             # --- 2. Optimization Phase ---
+            optimization_start_time = time.time()
             self.model.train()
             kl_exceeded = False
             is_first_gradient_step = True
@@ -428,7 +439,7 @@ class GRPOTrainer:
                             is_first_step=is_first_gradient_step,
                         )
                         compute_loss_time = time.time() - compute_loss_start_time
-                        print(f"    compute_loss took {compute_loss_time:.3f}s")
+                        print(f"    compute_loss took {compute_loss_time:.3f}s, advantages non-zero: {torch.any(micro_batch_data['advantages'] != 0).item()}")
                         loss = metrics['loss']
                         
                         # Accumulate gradients
@@ -522,6 +533,11 @@ class GRPOTrainer:
                 
                 if kl_exceeded:
                     break
+
+            optimization_time = time.time() - optimization_start_time
+            print(f"Optimization for step {collection_step} took {optimization_time:.2f}s")
+            if use_wandb:
+                wandb.log({"train/optimization_time": optimization_time, "collection_step": collection_step})
 
         # Final evaluation if eval dataset provided
         if eval_dataset is not None:
