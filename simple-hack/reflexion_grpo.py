@@ -9,7 +9,7 @@ import torch
 from torch.nn import functional as F
 from torch.optim.lr_scheduler import LinearLR
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 import wandb
 
 from datasets import Dataset
@@ -278,7 +278,7 @@ class GRPOTrainer:
                 f"{eval_type}_eval/reward_std": metrics.get("eval_reward_std", 0),
                 f"{eval_type}_eval/avg_response_length": metrics.get("eval_avg_response_length", 0),
                 "episode": episode
-            })
+            }, step=episode)
         
         return metrics
 
@@ -296,6 +296,8 @@ class GRPOTrainer:
         kl_threshold: float = 0.02,
         use_revision: bool = False,
         minibatch_size: int = 1,
+        save_steps: int = 0,
+        repo_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Train the model using GRPO.
         
@@ -312,6 +314,8 @@ class GRPOTrainer:
         kl_threshold : KL divergence threshold for early stopping
         use_revision : whether to use revision model for sampling
         minibatch_size : size of minibatches for optimization
+        save_steps : number of optimization steps between saving LoRA checkpoints
+        repo_id : Hugging Face Hub repository ID to push checkpoints to.
         
         Returns
         -------
@@ -325,20 +329,27 @@ class GRPOTrainer:
             initial_metrics = self._run_evaluation(eval_dataset, tokenizer, max_new_tokens, "initial", 0, use_wandb)
 
         print("Starting GRPO training...")
+
+        leftover_experience = []
         
         # Main training loop (steps are now data collection cycles)
         for collection_step in range(1, collection_steps + 1):
             
             # --- 1. Data Collection Phase ---
             collection_start_time = time.time()
-            experience_buffer = []
+            experience_buffer = leftover_experience
+            leftover_experience = []
             step_rewards_mean = []
             step_rewards_max = []
             step_success_rates = []
+            all_zero_rewards_count = 0
+            all_one_rewards_count = 0
+            prompts_processed_count = 0
 
             print(f"\nCollecting experience for collection step {collection_step}/{collection_steps}...")
             self.model.eval()
-            for micro_step in range(batch_size // prompts_per_generation):
+            micro_step = 0
+            while (len(experience_buffer) < batch_size):
                 # Sample a fresh batch for each accumulation step
                 if use_revision:
                     sample_start_time = time.time()
@@ -369,16 +380,20 @@ class GRPOTrainer:
                 loss_mask_chunks = torch.split(loss_mask, rollouts_per_prompt)
 
                 for i in range(prompts_per_generation):
-                    with torch.no_grad():
-                        chunk_logp = self._compute_log_probs(self.model, input_ids_chunks[i])
+                    # Track reward statistics per-prompt
+                    prompts_processed_count += 1
+                    if torch.all(rewards_chunks[i] == 0):
+                        all_zero_rewards_count += 1
+                    if torch.all(rewards_chunks[i] == 1):
+                        all_one_rewards_count += 1
 
-                    experience_buffer.append({
-                        'input_ids': input_ids_chunks[i].to('cpu'), 
-                        'rewards': rewards_chunks[i].to('cpu'),
-                        'advantages': advantages_chunks[i].to('cpu'),
-                        'loss_mask': loss_mask_chunks[i].to('cpu'),
-                        'old_logp_full': chunk_logp.detach().to('cpu')
-                    })
+                    if (not torch.all(advantages_chunks[i] == 0)):
+                        experience_buffer.append({
+                            'input_ids': input_ids_chunks[i].to('cpu'), 
+                            'rewards': rewards_chunks[i].to('cpu'),
+                            'advantages': advantages_chunks[i].to('cpu'),
+                            'loss_mask': loss_mask_chunks[i].to('cpu'),
+                        })
                 
                 # Track and log rewards from this collection micro-batch
                 batch_reward_mean = rewards.mean().item()
@@ -386,8 +401,20 @@ class GRPOTrainer:
                 step_rewards_mean.append(batch_reward_mean)
                 step_rewards_max.append(rewards.max().item())
                 step_success_rates.append((rewards > 0).float().mean().item())
-                print(f"  Collected micro-batch {micro_step+1}/{batch_size // prompts_per_generation} | reward: {batch_reward_mean:.3f}")
+                print(f"  Collected micro-batch {micro_step+1}/projected {batch_size // prompts_per_generation} | reward: {batch_reward_mean:.3f}")
+                micro_step += 1
+
+            leftover_experience = experience_buffer[batch_size:]
+            print(f"Saving {len(leftover_experience)} trajectories for next collection step...")
             
+
+            # Calculate old_logp_full for all trajectories we will optimize
+            for experience in experience_buffer:
+                with torch.no_grad():
+                    old_logp_full = self._compute_log_probs(self.model, experience['input_ids'])
+                    experience['old_logp_full'] = old_logp_full.detach().to('cpu')
+
+
             # Clear GPU cache after all experience collection is complete
             print("Clearing GPU cache after experience collection...")
             torch.cuda.empty_cache()
@@ -395,19 +422,24 @@ class GRPOTrainer:
             collection_time = time.time() - collection_start_time
             print(f"Data collection for step {collection_step} took {collection_time:.2f}s")
             if use_wandb:
-                wandb.log({"train/data_collection_time": collection_time, "collection_step": collection_step})
+                wandb.log({"train/data_collection_time": collection_time, "collection_step": collection_step}, step=total_optim_steps)
 
             # --- 2. Optimization Phase ---
             optimization_start_time = time.time()
             self.model.train()
             kl_exceeded = False
             is_first_gradient_step = True
+            
+            # Calculate reward distribution fractions
+            fraction_all_zero_rewards = (all_zero_rewards_count / prompts_processed_count) if prompts_processed_count > 0 else 0
+            fraction_all_one_rewards = (all_one_rewards_count / prompts_processed_count) if prompts_processed_count > 0 else 0
+            
             for epoch in range(epochs_per_batch):
                 random.shuffle(experience_buffer)  # Shuffle experience for each epoch
                 
                 # Process in minibatches
-                for i in range(0, len(experience_buffer), minibatch_size):
-                    minibatch = experience_buffer[i:i+minibatch_size]
+                for i in range(0, batch_size, minibatch_size):
+                    minibatch = experience_buffer[i:i+minibatch_size]   # Note: i+minibatch_size may exceed len(experience_buffer)
                     
                     self.optimizer.zero_grad()
                     
@@ -417,7 +449,6 @@ class GRPOTrainer:
                     minibatch_clipped_fractions = []
                     minibatch_response_lengths = []
                     minibatch_entropies = []
-                    non_zero_advantages_count = 0
 
                     # Iterate over the collected experience in the minibatch
                     for micro_batch_data in minibatch:
@@ -440,15 +471,12 @@ class GRPOTrainer:
                             is_first_step=is_first_gradient_step,
                         )
                         compute_loss_time = time.time() - compute_loss_start_time
-                        print(f"    compute_loss took {compute_loss_time:.3f}s, advantages non-zero: {torch.any(micro_batch_data['advantages'] != 0).item()}")
+                        print(f"    compute_loss took {compute_loss_time:.3f}s")
                         
-                        # Track advantages for logging
-                        if torch.any(micro_batch_data['advantages'] != 0):
-                            non_zero_advantages_count += 1
-
                         loss = metrics['loss']
                         
                         # Accumulate gradients
+                        loss = loss / len(minibatch)    # Normalize loss by number of minibatches
                         loss.backward()
 
                         # Store metrics for logging
@@ -470,6 +498,23 @@ class GRPOTrainer:
 
                     # Clip gradients and perform optimizer step after accumulating over the whole minibatch
                     total_optim_steps += 1
+                    
+                    if save_steps > 0 and total_optim_steps % save_steps == 0 and repo_id:
+                        if hasattr(self.model, "push_to_hub"):
+                            branch_name = f"step-{total_optim_steps}"
+                            try:
+                                self.model.push_to_hub(
+                                    repo_id, 
+                                    commit_message=f"Checkpoint at step {total_optim_steps}",
+                                    revision=branch_name,
+                                )
+                                print(f"Pushed LoRA checkpoint to Hugging Face Hub repository {repo_id} on branch {branch_name} at step {total_optim_steps}")
+                            except Exception as e:
+                                print(f"Failed to push to Hub: {e}")
+                                print("Please ensure you are logged in to Hugging Face Hub via `huggingface-cli login` or by setting the HUGGING_FACE_HUB_TOKEN environment variable.")
+                                print("You may also need to create the repository on the Hub first.")
+                        else:
+                            print("Warning: Model does not have `push_to_hub` method. Skipping checkpoint.")
                     
                     # Gradient Norm Calculation and Clipping. clip_grad_norm_ returns the total norm of
                     # all parameters (viewed as a single vector) before clipping.
@@ -501,8 +546,6 @@ class GRPOTrainer:
                     avg_reward_std = minibatch_rewards.std().item()
                     avg_success_rate = (minibatch_rewards > 0).float().mean().item()
                     
-                    fraction_non_zero_advantages = non_zero_advantages_count / len(minibatch) if minibatch else 0.0
-
                     if use_wandb:
                         wandb.log({
                             "train/loss": avg_loss,
@@ -517,14 +560,14 @@ class GRPOTrainer:
                             "train/batch_success_rate": avg_success_rate,
                             "train/model_entropy": avg_entropy,
                             "train/grad_norm": grad_norm,
-                            "train/fraction_non_zero_advantages": fraction_non_zero_advantages,
-                            "step": total_optim_steps,
+                            "train/fraction_all_zero_rewards": fraction_all_zero_rewards,
+                            "train/fraction_all_one_rewards": fraction_all_one_rewards,
                             "collection_step": collection_step,
                             "epoch_per_batch": epoch + 1,
-                        })
+                        }, step=total_optim_steps)
                     
                     minibatch_num = i // minibatch_size + 1
-                    total_minibatches = math.ceil(len(experience_buffer) / minibatch_size)
+                    total_minibatches = math.ceil(batch_size / minibatch_size)
                     
                     print(
                         f"Optim Step {total_optim_steps:05d} | Collection Step {collection_step}/{collection_steps}, Epoch {epoch+1}/{epochs_per_batch}, MiniBatch {minibatch_num}/{total_minibatches} | "
@@ -537,6 +580,8 @@ class GRPOTrainer:
                         f"reward_std: {avg_reward_std:.3f} | "
                         f"grad_norm: {grad_norm:.4f} | "
                         f"success: {avg_success_rate:.1%} | "
+                        f"zeros: {all_zero_rewards_count}/{prompts_processed_count} | "
+                        f"ones: {all_one_rewards_count}/{prompts_processed_count} | "
                         f"entropy: {avg_entropy:.4f}"
                     )
                 
@@ -546,7 +591,7 @@ class GRPOTrainer:
             optimization_time = time.time() - optimization_start_time
             print(f"Optimization for step {collection_step} took {optimization_time:.2f}s")
             if use_wandb:
-                wandb.log({"train/optimization_time": optimization_time, "collection_step": collection_step})
+                wandb.log({"train/optimization_time": optimization_time, "collection_step": collection_step}, step=total_optim_steps)
 
         # Final evaluation if eval dataset provided
         if eval_dataset is not None:
@@ -1002,6 +1047,10 @@ def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_siz
 
 
 def main():
+    print("\n")
+    print("Log into Hugging Face to save model checkpoints!!!!!!!!!!!!")
+    print("\n")
+    
     # Set print options to print full tensors
     torch.set_printoptions(threshold=10_000, linewidth=200)
 
@@ -1028,6 +1077,8 @@ def main():
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha scaling parameter")
     parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA dropout")
+    parser.add_argument("--lora_weights_name", type=str, default=None, help="HuggingFace repository ID for LoRA weights to load and continue training.")
+    parser.add_argument("--lora_revision", type=str, default="main", help="Git revision (branch, tag, or commit hash) of the LoRA weights to load.")
     
     # Memory optimization
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing to save memory")
@@ -1050,6 +1101,7 @@ def main():
     
     # Gradient clipping configuration
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Gradient clipping norm. Set to 0 or negative to disable clipping")
+    parser.add_argument("--save_steps", type=int, default=100, help="Number of optimization steps between saving LoRA checkpoints to Hugging Face Hub.")
 
     args = parser.parse_args()
 
@@ -1060,6 +1112,10 @@ def main():
             name=args.wandb_run_name,
             config=vars(args)  # Log all hyperparameters
         )
+    
+    run_id = wandb.run.id if args.use_wandb and wandb.run else f"local-{int(time.time())}"
+    model_name_safe = args.model_name.split("/")[-1].replace('.', '_')
+    repo_id = f"Pritish92/{model_name_safe}-grpo-math-lora-{run_id}"
 
     # Load model & tokenizer (trust_remote_code required for Qwen series)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
@@ -1126,16 +1182,27 @@ def main():
 
     # Apply LoRA by default (unless disabled)
     if args.use_lora:
-        print("Applying LoRA for parameter-efficient fine-tuning...")
-        lora_config = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            lora_dropout=args.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM"
-        )
-        model = get_peft_model(base_model, lora_config)
+        if args.lora_weights_name:
+            print(f"Loading LoRA adapters from {args.lora_weights_name} (revision: {args.lora_revision})...")
+            model = PeftModel.from_pretrained(
+                base_model, 
+                args.lora_weights_name, 
+                is_trainable=True,
+                revision=args.lora_revision,
+            )
+            print("LoRA adapters loaded.")
+        else:
+            print("Applying new LoRA for parameter-efficient fine-tuning...")
+            lora_config = LoraConfig(
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                lora_dropout=args.lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM"
+            )
+            model = get_peft_model(base_model, lora_config)
+        
         model.print_trainable_parameters()
         # With LoRA, the reference model is the frozen base model
         ref_model = base_model
@@ -1203,17 +1270,27 @@ def main():
         kl_threshold=args.kl_threshold,
         use_revision=args.use_revision,
         minibatch_size=args.minibatch_size,
+        save_steps=args.save_steps,
+        repo_id=repo_id if args.use_lora else None,
     )
 
     print("Training complete!")
     
-    # Save model (LoRA adapters if using LoRA, full model otherwise)
-    if args.use_lora:
-        print("Saving LoRA adapters...")
-        model.save_pretrained(f"./lora_adapters_grpo_math")
-        print(f"LoRA adapters saved to ./lora_adapters_grpo_math")
-    else:
-        print("To save full model, use: model.save_pretrained('./saved_model')")
+    # # Save model (LoRA adapters if using LoRA, full model otherwise)
+    # if args.use_lora:
+    #     print("Saving final LoRA adapters locally...")
+    #     save_directory = f"./lora_adapters_grpo_math-{run_id}"
+    #     model.save_pretrained(save_directory)
+    #     print(f"LoRA adapters saved to {save_directory}")
+
+    #     print(f"Pushing final LoRA adapters to Hugging Face Hub: {repo_id}")
+    #     try:
+    #         model.push_to_hub(repo_id, commit_message="Final model checkpoint")
+    #         print(f"Successfully pushed to main branch of {repo_id}")
+    #     except Exception as e:
+    #         print(f"Failed to push final model to Hub: {e}")
+    # else:
+    #     print("To save full model, use: model.save_pretrained('./saved_model')")
     
     if args.use_wandb:
         wandb.finish()
