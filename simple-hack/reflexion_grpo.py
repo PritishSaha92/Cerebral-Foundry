@@ -1,6 +1,8 @@
 import argparse
 import math
 import random
+import signal
+import sys
 import time
 from typing import List, Dict, Any, Optional, Tuple
 import copy
@@ -16,12 +18,42 @@ from datasets import Dataset
 
 # Import math problem generation and reward functions
 from functions import generate_math_problems, math_reward_func, parse_completion
-from reflexion_grpo_tests import test_sample, debug_batch_and_actions
+from reflexion_grpo_tests import test_sample, debug_batch_and_actions, test_combined_experience
 
 # Global token IDs - initialized in main() after tokenizer is loaded
 PAD_TOKEN_ID = None
 EOS_TOKEN_ID = None
 SEQUENCE_LENGTH_NORMALIZATION = 1000.0
+
+# Helper function for wandb cleanup
+def cleanup_wandb():
+    """Safely finish wandb run if it's active."""
+    if wandb.run is not None:
+        print("Finishing wandb run...")
+        try:
+            wandb.finish()
+            print("Wandb run finished.")
+        except Exception as e:
+            print(f"Failed to finish wandb: {e}")
+
+# Signal handler for graceful shutdown
+def signal_handler(signum, frame):
+    """Handle termination signals gracefully by finishing wandb and exiting."""
+    signal_names = {
+        signal.SIGINT: "SIGINT (CTRL+C)",
+        signal.SIGTERM: "SIGTERM (termination request)",
+        signal.SIGPIPE: "SIGPIPE (broken pipe/SSH disconnect)",
+        signal.SIGHUP: "SIGHUP (hangup/terminal closed)"
+    }
+    signal_name = signal_names.get(signum, f"signal {signum}")
+    print(f"\nReceived {signal_name}. Gracefully shutting down...")
+    
+    cleanup_wandb()
+    
+    print("Exiting gracefully.")
+    sys.exit(0)
+
+
 
 # ============================================================
 #   Generalized Reinforced Policy Optimization (GRPO)
@@ -140,6 +172,60 @@ class GRPOTrainer:
         ratio_ref = torch.exp(log_ratio_ref)
         kl_losses = ratio_ref - log_ratio_ref - 1
         return kl_losses
+
+    def _combine_experiences(self, experiences: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Combines a list of experiences into a single batch for loss computation.
+
+        Pads `input_ids` and `loss_mask` tensors to the maximum
+        sequence length in the list of experiences. `rewards` and `advantages` are
+        simply concatenated.
+
+        Args:
+            experiences: A list of experience dictionaries. Each dictionary corresponds
+                         to one prompt and contains tensors for `rollouts_per_prompt` sequences.
+
+        Returns:
+            A single dictionary containing the combined and padded tensors, ready for
+            `compute_loss`.
+        """
+        if not experiences:
+            return {}
+
+        # Find the maximum sequence length in the batch of experiences
+        max_len = max(exp['input_ids'].shape[1] for exp in experiences)
+
+        padded_input_ids = []
+        padded_loss_masks = []
+        all_rewards = []
+        all_advantages = []
+
+        for exp in experiences:
+            input_ids = exp['input_ids']
+            loss_mask = exp['loss_mask']
+            
+            # Amount of padding needed for this experience's tensors
+            padding_len = max_len - input_ids.shape[1]
+
+            # Pad 'input_ids' to max_len on the right (sequence dimension)
+            padded_ids = F.pad(input_ids, (0, padding_len), 'constant', PAD_TOKEN_ID)
+            padded_input_ids.append(padded_ids)
+
+            # Pad 'loss_mask' to match the new tensor dimensions.
+            # The mask is shorter by 1 in the sequence dimension.
+            padded_mask = F.pad(loss_mask, (0, padding_len), 'constant', False)
+            padded_loss_masks.append(padded_mask)
+
+            # These tensors do not have a sequence length dimension to pad, so just append
+            all_rewards.append(exp['rewards'])
+            all_advantages.append(exp['advantages'])
+
+        # Concatenate all tensors along the batch dimension (dim=0)
+        return {
+            'input_ids': torch.cat(padded_input_ids, dim=0),
+            'loss_mask': torch.cat(padded_loss_masks, dim=0),
+            'rewards': torch.cat(all_rewards, dim=0),
+            'advantages': torch.cat(all_advantages, dim=0),
+        }
 
     def _disable_dropout(self, model):
         """Sets all dropout layers to eval mode for the given model."""
@@ -291,6 +377,7 @@ class GRPOTrainer:
         rollouts_per_prompt: int,
         prompts_per_generation: int,
         max_new_tokens: int,
+        prompts_per_compute_loss: int = 1,
         eval_dataset: Optional[Any] = None,
         use_wandb: bool = False,
         kl_threshold: float = 0.02,
@@ -405,14 +492,23 @@ class GRPOTrainer:
                 micro_step += 1
 
             leftover_experience = experience_buffer[batch_size:]
-            print(f"Saving {len(leftover_experience)} trajectories for next collection step...")
+            print(f"Saving {len(leftover_experience)} prompts for next collection step...")
+            experience_buffer = experience_buffer[:batch_size]
             
+            processed_buffer = []
 
             # Calculate old_logp_full for all trajectories we will optimize
-            for experience in experience_buffer:
+            for i in range(0, len(experience_buffer), prompts_per_compute_loss):
+                sublist = experience_buffer[i:i+prompts_per_compute_loss]
+                combined_experience = self._combine_experiences(sublist)
+                
                 with torch.no_grad():
-                    old_logp_full = self._compute_log_probs(self.model, experience['input_ids'])
-                    experience['old_logp_full'] = old_logp_full.detach().to('cpu')
+                    old_logp_full = self._compute_log_probs(self.model, combined_experience['input_ids'])
+                    combined_experience['old_logp_full'] = old_logp_full.detach().to('cpu')
+
+                # test_combined_experience(combined_experience, prompts_per_compute_loss, rollouts_per_prompt)
+                
+                processed_buffer.append(combined_experience)
 
 
             # Clear GPU cache after all experience collection is complete
@@ -422,7 +518,7 @@ class GRPOTrainer:
             collection_time = time.time() - collection_start_time
             print(f"Data collection for step {collection_step} took {collection_time:.2f}s")
             if use_wandb:
-                wandb.log({"train/data_collection_time": collection_time, "collection_step": collection_step}, step=total_optim_steps)
+                wandb.log({"train/data_collection_time": collection_time, "collection_step": collection_step}, step=total_optim_steps+1)
 
             # --- 2. Optimization Phase ---
             optimization_start_time = time.time()
@@ -433,13 +529,17 @@ class GRPOTrainer:
             # Calculate reward distribution fractions
             fraction_all_zero_rewards = (all_zero_rewards_count / prompts_processed_count) if prompts_processed_count > 0 else 0
             fraction_all_one_rewards = (all_one_rewards_count / prompts_processed_count) if prompts_processed_count > 0 else 0
+
+            # Each item in processed_buffer corresponds to prompts_per_compute_loss prompts.
+            # We calculate a step size to ensure `minibatch_size` correctly refers to the number of prompts.
+            minibatch_step = max(1, minibatch_size // prompts_per_compute_loss)
             
             for epoch in range(epochs_per_batch):
-                random.shuffle(experience_buffer)  # Shuffle experience for each epoch
+                random.shuffle(processed_buffer)  # Shuffle experience for each epoch
                 
                 # Process in minibatches
-                for i in range(0, batch_size, minibatch_size):
-                    minibatch = experience_buffer[i:i+minibatch_size]   # Note: i+minibatch_size may exceed len(experience_buffer)
+                for i in range(0, len(processed_buffer), minibatch_step):
+                    minibatch = processed_buffer[i:i+minibatch_step]   # Note: i+minibatch_step may exceed len(processed_buffer)
                     
                     self.optimizer.zero_grad()
                     
@@ -476,7 +576,7 @@ class GRPOTrainer:
                         loss = metrics['loss']
                         
                         # Accumulate gradients
-                        loss = loss / len(minibatch)    # Normalize loss by number of minibatches
+                        loss = loss / minibatch_size    # Normalize by minibatch_size
                         loss.backward()
 
                         # Store metrics for logging
@@ -517,8 +617,8 @@ class GRPOTrainer:
                             print("Warning: Model does not have `push_to_hub` method. Skipping checkpoint.")
                     
                     # Gradient Norm Calculation and Clipping. clip_grad_norm_ returns the total norm of
-                    # all parameters (viewed as a single vector) before clipping.
-                    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm).item()
+                    # all parameters (viewed as a single vector) BEFORE clipping.
+                    unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm).item()
 
                     self.optimizer.step()
                     
@@ -559,15 +659,15 @@ class GRPOTrainer:
                             "train/batch_reward_std": avg_reward_std,
                             "train/batch_success_rate": avg_success_rate,
                             "train/model_entropy": avg_entropy,
-                            "train/grad_norm": grad_norm,
+                            "train/unclipped_grad_norm": unclipped_grad_norm,
                             "train/fraction_all_zero_rewards": fraction_all_zero_rewards,
                             "train/fraction_all_one_rewards": fraction_all_one_rewards,
                             "collection_step": collection_step,
                             "epoch_per_batch": epoch + 1,
                         }, step=total_optim_steps)
                     
-                    minibatch_num = i // minibatch_size + 1
-                    total_minibatches = math.ceil(batch_size / minibatch_size)
+                    minibatch_num = i // minibatch_step + 1
+                    total_minibatches = math.ceil(len(processed_buffer) / minibatch_step)
                     
                     print(
                         f"Optim Step {total_optim_steps:05d} | Collection Step {collection_step}/{collection_steps}, Epoch {epoch+1}/{epochs_per_batch}, MiniBatch {minibatch_num}/{total_minibatches} | "
@@ -578,7 +678,7 @@ class GRPOTrainer:
                         f"lr: {current_lr:.2e} | "
                         f"reward: {avg_reward_mean:.3f} | "
                         f"reward_std: {avg_reward_std:.3f} | "
-                        f"grad_norm: {grad_norm:.4f} | "
+                        f"unclipped_grad_norm: {unclipped_grad_norm:.4f} | "
                         f"success: {avg_success_rate:.1%} | "
                         f"zeros: {all_zero_rewards_count}/{prompts_processed_count} | "
                         f"ones: {all_one_rewards_count}/{prompts_processed_count} | "
@@ -1071,6 +1171,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1, help="Number of prompts to sample from for each optimization step.")
     parser.add_argument("--epochs_per_batch", type=int, default=4, help="Number of optimization epochs to run on each collected batch of experience")
     parser.add_argument("--minibatch_size", type=int, default=1, help="Size of minibatches for optimization.")
+    parser.add_argument("--prompts_per_compute_loss", type=int, default=1, help="Number of prompts to batch together for a single loss computation.")
     
     # LoRA configuration
     parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA for parameter-efficient fine-tuning")
@@ -1104,6 +1205,29 @@ def main():
     parser.add_argument("--save_steps", type=int, default=100, help="Number of optimization steps between saving LoRA checkpoints to Hugging Face Hub.")
 
     args = parser.parse_args()
+
+    # --- Batch Size Validations ---
+    # We must have mini_batch_size evenly-divide batch_size.
+    if args.batch_size % args.minibatch_size != 0:
+        print(f"Error: minibatch_size ({args.minibatch_size}) must evenly divide batch_size ({args.batch_size}).")
+        sys.exit(1)
+        
+    # We must have prompts_per_generation evenly-divide batch_size.
+    if args.batch_size % args.prompts_per_generation != 0:
+        print(f"Error: prompts_per_generation ({args.prompts_per_generation}) must evenly divide batch_size ({args.batch_size}).")
+        sys.exit(1)
+
+    # We must have prompts_per_compute_loss evenly-divide mini_batch_size.
+    if args.minibatch_size % args.prompts_per_compute_loss != 0:
+        print(f"Error: prompts_per_compute_loss ({args.prompts_per_compute_loss}) must evenly divide minibatch_size ({args.minibatch_size}).")
+        sys.exit(1)
+
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)   # CTRL+C
+    signal.signal(signal.SIGTERM, signal_handler)  # Termination request
+    signal.signal(signal.SIGPIPE, signal_handler)  # Broken pipe (common with SSH disconnects)
+    signal.signal(signal.SIGHUP, signal_handler)   # Hangup (terminal closed)
+    print("Signal handlers registered for graceful shutdown (CTRL+C, broken pipe, hangup, etc.)")
 
     # Initialize wandb if requested
     if args.use_wandb:
@@ -1235,65 +1359,73 @@ def main():
         grad_clip_norm=args.grad_clip_norm if args.grad_clip_norm > 0 else None,
     )
 
-    print("Starting GRPO fine-tuning with math problems …")
-    if args.use_lora:
-        print("Using LoRA for parameter-efficient fine-tuning.")
-    else:
-        print("Training full model. Consider using --use_lora for better memory efficiency.")
-    
-    # Create eval dataset once for reuse
-    print(f"Creating evaluation dataset with {args.eval_size} problems...")
-    
-    # Generate data for evaluation
-    eval_data = []
-    problem_generator = generate_math_problems(tokenizer, args.eval_size)
-    for problem in problem_generator:
-        eval_data.append({
-            "query": problem["prompt"],
-            "target": problem["target"],
-            "numbers": problem["numbers"]
-        })
-    
-    eval_dataset = Dataset.from_list(eval_data)
-    
-    # Run training using the new train method
-    training_results = trainer.train(
-        tokenizer=tokenizer,
-        collection_steps=collection_steps,
-        batch_size=args.batch_size,
-        epochs_per_batch=args.epochs_per_batch,
-        rollouts_per_prompt=args.rollouts_per_prompt,
-        prompts_per_generation=args.prompts_per_generation,
-        max_new_tokens=args.max_new_tokens,
-        eval_dataset=eval_dataset,
-        use_wandb=args.use_wandb,
-        kl_threshold=args.kl_threshold,
-        use_revision=args.use_revision,
-        minibatch_size=args.minibatch_size,
-        save_steps=args.save_steps,
-        repo_id=repo_id if args.use_lora else None,
-    )
+    try:
+        print("Starting GRPO fine-tuning with math problems …")
+        if args.use_lora:
+            print("Using LoRA for parameter-efficient fine-tuning.")
+        else:
+            print("Training full model. Consider using --use_lora for better memory efficiency.")
+        
+        # Create eval dataset once for reuse
+        print(f"Creating evaluation dataset with {args.eval_size} problems...")
+        
+        # Generate data for evaluation
+        eval_data = []
+        problem_generator = generate_math_problems(tokenizer, args.eval_size)
+        for problem in problem_generator:
+            eval_data.append({
+                "query": problem["prompt"],
+                "target": problem["target"],
+                "numbers": problem["numbers"]
+            })
+        
+        eval_dataset = Dataset.from_list(eval_data)
+        
+        # Run training using the new train method
+        training_results = trainer.train(
+            tokenizer=tokenizer,
+            collection_steps=collection_steps,
+            batch_size=args.batch_size,
+            epochs_per_batch=args.epochs_per_batch,
+            rollouts_per_prompt=args.rollouts_per_prompt,
+            prompts_per_generation=args.prompts_per_generation,
+            max_new_tokens=args.max_new_tokens,
+            prompts_per_compute_loss=args.prompts_per_compute_loss,
+            eval_dataset=eval_dataset,
+            use_wandb=args.use_wandb,
+            kl_threshold=args.kl_threshold,
+            use_revision=args.use_revision,
+            minibatch_size=args.minibatch_size,
+            save_steps=args.save_steps,
+            repo_id=repo_id if args.use_lora else None,
+        )
 
-    print("Training complete!")
-    
-    # # Save model (LoRA adapters if using LoRA, full model otherwise)
-    # if args.use_lora:
-    #     print("Saving final LoRA adapters locally...")
-    #     save_directory = f"./lora_adapters_grpo_math-{run_id}"
-    #     model.save_pretrained(save_directory)
-    #     print(f"LoRA adapters saved to {save_directory}")
+        print("Training complete!")
+        
+        # # Save model (LoRA adapters if using LoRA, full model otherwise)
+        # if args.use_lora:
+        #     print("Saving final LoRA adapters locally...")
+        #     save_directory = f"./lora_adapters_grpo_math-{run_id}"
+        #     model.save_pretrained(save_directory)
+        #     print(f"LoRA adapters saved to {save_directory}")
 
-    #     print(f"Pushing final LoRA adapters to Hugging Face Hub: {repo_id}")
-    #     try:
-    #         model.push_to_hub(repo_id, commit_message="Final model checkpoint")
-    #         print(f"Successfully pushed to main branch of {repo_id}")
-    #     except Exception as e:
-    #         print(f"Failed to push final model to Hub: {e}")
-    # else:
-    #     print("To save full model, use: model.save_pretrained('./saved_model')")
-    
-    if args.use_wandb:
-        wandb.finish()
+        #     print(f"Pushing final LoRA adapters to Hugging Face Hub: {repo_id}")
+        #     try:
+        #         model.push_to_hub(repo_id, commit_message="Final model checkpoint")
+        #         print(f"Successfully pushed to main branch of {repo_id}")
+        #     except Exception as e:
+        #         print(f"Failed to push final model to Hub: {e}")
+        # else:
+        #     print("To save full model, use: model.save_pretrained('./saved_model')")
+        
+    except Exception as e:
+        print(f"\nTraining failed with exception: {e}")
+        import traceback
+        traceback.print_exc()
+        raise  # Re-raise to ensure non-zero exit code
+    finally:
+        # Always cleanup wandb, whether training completed successfully or failed
+        cleanup_wandb()
 
 
 if __name__ == "__main__":
