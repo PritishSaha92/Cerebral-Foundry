@@ -6,6 +6,7 @@ import sys
 import time
 from typing import List, Dict, Any, Optional, Tuple
 import copy
+from enum import Enum
 
 import torch
 from torch.nn import functional as F
@@ -15,6 +16,7 @@ from peft import LoraConfig, get_peft_model, PeftModel
 import wandb
 
 from datasets import Dataset
+from enums import ModelType
 
 # Import math problem generation and reward functions
 from functions import generate_math_problems, math_reward_func, parse_completion
@@ -327,47 +329,6 @@ class GRPOTrainer:
             "model_entropy": mean_entropy,
         }
 
-    def _run_evaluation(
-        self,
-        eval_dataset: Any,
-        tokenizer: Any,
-        max_new_tokens: int,
-        eval_type: str,
-        episode: int,
-        use_wandb: bool = False,
-    ) -> Dict[str, Any]:
-        """Run evaluation and log results.
-        
-        Parameters
-        ----------
-        eval_dataset : evaluation dataset
-        tokenizer : tokenizer for the model
-        max_new_tokens : maximum new tokens to generate
-        eval_type : "initial" or "final" for logging purposes
-        episode : current episode number for wandb logging
-        use_wandb : whether to log to wandb
-        
-        Returns
-        -------
-        Dict with evaluation metrics
-        """
-        self.model.eval()
-
-        print(f"\nRunning {eval_type} evaluation...")
-        metrics = evaluate_model(self.model, tokenizer, eval_dataset, max_new_tokens)
-        print(f"{eval_type.capitalize()} metrics: {metrics}")
-
-        if use_wandb:
-            wandb.log({
-                f"{eval_type}_eval/success_rate": metrics.get("eval_success_rate", 0),
-                f"{eval_type}_eval/reward_mean": metrics.get("eval_reward_mean", 0),
-                f"{eval_type}_eval/reward_std": metrics.get("eval_reward_std", 0),
-                f"{eval_type}_eval/avg_response_length": metrics.get("eval_avg_response_length", 0),
-                "episode": episode
-            }, step=episode)
-        
-        return metrics
-
     def train(
         self,
         tokenizer: Any,
@@ -378,13 +339,13 @@ class GRPOTrainer:
         prompts_per_generation: int,
         max_new_tokens: int,
         prompts_per_compute_loss: int = 1,
-        eval_dataset: Optional[Any] = None,
         use_wandb: bool = False,
         kl_threshold: float = 0.02,
         use_revision: bool = False,
         minibatch_size: int = 1,
         save_steps: int = 0,
         repo_id: Optional[str] = None,
+        model_type: ModelType = ModelType.THINKING,
     ) -> Dict[str, Any]:
         """Train the model using GRPO.
         
@@ -396,13 +357,13 @@ class GRPOTrainer:
         epochs_per_batch : number of optimization epochs to run on each collected batch of experience
         rollouts_per_prompt : number of rollouts to generate for each prompt
         max_new_tokens : maximum new tokens to generate
-        eval_dataset : optional dataset for evaluation
         use_wandb : whether to log to wandb
         kl_threshold : KL divergence threshold for early stopping
         use_revision : whether to use revision model for sampling
         minibatch_size : size of minibatches for optimization
         save_steps : number of optimization steps between saving LoRA checkpoints
         repo_id : Hugging Face Hub repository ID to push checkpoints to.
+        model_type : Type of model training.
         
         Returns
         -------
@@ -411,10 +372,6 @@ class GRPOTrainer:
         total_optim_steps = 0
         training_rewards = []
         
-        # Initial evaluation if eval dataset provided
-        if eval_dataset is not None:
-            initial_metrics = self._run_evaluation(eval_dataset, tokenizer, max_new_tokens, "initial", 0, use_wandb)
-
         print("Starting GRPO training...")
 
         leftover_experience = []
@@ -448,17 +405,18 @@ class GRPOTrainer:
                         prompts_per_generation=prompts_per_generation,
                         max_new_tokens=max_new_tokens,
                         disable_adapter=False,
-                        enable_thinking=False
+                        enable_thinking=False,
+                        model_type=model_type,
                     )
                     sample_time = time.time() - sample_start_time
                     print(f"  sample_and_revise took {sample_time:.2f}s")
                 else:
                     sample_start_time = time.time()
-                    batch = sample(self.model, tokenizer, rollouts_per_prompt=rollouts_per_prompt, prompts_per_generation=prompts_per_generation, max_new_tokens=max_new_tokens)
+                    batch = sample(self.model, tokenizer, rollouts_per_prompt=rollouts_per_prompt, prompts_per_generation=prompts_per_generation, max_new_tokens=max_new_tokens, model_type=model_type)
                     sample_time = time.time() - sample_start_time
                     print(f"  sample took {sample_time:.2f}s")
                 
-                input_ids, rewards, advantages, loss_mask, _, _ = batch
+                input_ids, rewards, advantages, loss_mask, _, _, _ = batch
 
                 # Split tensors
                 input_ids_chunks = torch.split(input_ids, rollouts_per_prompt)
@@ -693,23 +651,11 @@ class GRPOTrainer:
             if use_wandb:
                 wandb.log({"train/optimization_time": optimization_time, "collection_step": collection_step}, step=total_optim_steps)
 
-        # Final evaluation if eval dataset provided
-        if eval_dataset is not None:
-            final_metrics = self._run_evaluation(eval_dataset, tokenizer, max_new_tokens, "final", total_optim_steps, use_wandb)
-                
-            # Log training summary
-            if use_wandb and wandb.run is not None:
-                wandb.run.summary["total_steps"] = total_optim_steps
-                wandb.run.summary["final_success_rate"] = final_metrics.get("eval_success_rate", 0)
-                wandb.run.summary["improvement"] = final_metrics.get("eval_success_rate", 0) - initial_metrics.get("eval_success_rate", 0)
-
         print("Training complete!")
         
         return {
             "total_steps": total_optim_steps,
             "training_rewards": training_rewards,
-            "final_metrics": final_metrics if eval_dataset is not None else None,
-            "initial_metrics": initial_metrics if eval_dataset is not None else None,
         }
 
 
@@ -808,7 +754,7 @@ def compute_sequence_advantages(rewards: torch.Tensor, prompts_per_generation: i
     return advantages_per_prompt.view(-1)
 
 
-def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapter=False, enable_thinking: bool = True, **gen_kwargs):
+def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapter=False, enable_thinking: bool = True, model_type: ModelType = ModelType.THINKING, **gen_kwargs):
     """Generates completions from a model and decodes them.
 
     Parameters
@@ -825,6 +771,8 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
         If True, temporarily disables PEFT adapters during generation when supported.
     enable_thinking : bool, optional
         If True, enables the chat template's "thinking" mode when available.
+    model_type : str, optional
+        The type of model prompt to use.
     **gen_kwargs : Any
         Additional keyword arguments forwarded to `model.generate()`.
 
@@ -841,27 +789,37 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
           Shape: `(batch_size, seq_len - 1)`.
     """
     
-    # Convert prompts to chat message format
-    messages_list = [[{"role": "user", "content": p}] for p in prompts]
-    
-    # # Debug: Print prompts for debugging
-    # print("Debug: Prompts being processed:")
-    # for i, prompt in enumerate(prompts):
-    #     print(f"Prompt {i}: {prompt}")
-    # print()
-    
-    # Apply chat template with thinking mode control
-    # This creates the full prompt string including special tokens
-    processed_prompts = [
-        tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True, # Note: Transformers recommends not using this during training but you get gibberish w/o it
-            enable_thinking=enable_thinking
-        ) for messages in messages_list
-    ]
+    if model_type == ModelType.BASE:
+        processed_prompts = prompts
+    else:
+        # Convert prompts to chat message format
+        messages_list = [[{"role": "user", "content": p}] for p in prompts]
+        
+        # # Debug: Print prompts for debugging
+        # print("Debug: Prompts being processed:")
+        # for i, prompt in enumerate(prompts):
+        #     print(f"Prompt {i}: {prompt}")
+        # print()
+        
+        # Apply chat template with thinking mode control
+        # This creates the full prompt string including special tokens
+        processed_prompts = [
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True, # Note: Transformers recommends not using this during training but you get gibberish w/o it
+                enable_thinking=enable_thinking
+            ) for messages in messages_list
+        ]
 
     tokenized = tokenizer(processed_prompts, return_tensors="pt", padding=True, truncation=True)
+
+    # print("HERE MOTHERFUCKER")
+    # print(tokenized)
+    # print(tokenized["input_ids"])
+    # print("\n")
+    # print(tokenizer.batch_decode(tokenized["input_ids"]))
+    # print("NEXT PART MOTHERFUCKER")
     
     # Base generation arguments
     base_gen_kwargs = {
@@ -912,7 +870,8 @@ def sample_and_revise(
     prompts_per_generation: int,
     max_new_tokens: int, 
     disable_adapter: bool, 
-    enable_thinking: bool
+    enable_thinking: bool,
+    model_type: ModelType = ModelType.THINKING,
 ):
     """Samples, revises, and evaluates completions.
 
@@ -947,7 +906,7 @@ def sample_and_revise(
 
     Returns
     -------
-    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str], List[str]]
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str], List[str], List[List[int]]]
         A tuple containing the data from the *revised* completions:
         - input_ids (torch.Tensor): The full token sequences of the *revised*
           completions (revision prompt + revised completion), padded.
@@ -961,10 +920,11 @@ def sample_and_revise(
           Shape: `(prompts_per_generation * rollouts_per_prompt, padded_revised_sequence_length - 1)`
         - prompts (List[str]): The list of original prompts (from the first pass).
         - final_completions (List[str]): The list of decoded *revised* completions.
+        - numbers_list (List[List[int]]): The list of numbers for each prompt.
     """
     # 1. First pass: Sample from the base model to get initial solutions
-    _, _, _, _, prompts, initial_completions = sample(
-        model, tokenizer, rollouts_per_prompt, prompts_per_generation, max_new_tokens
+    _, _, _, _, prompts, initial_completions, numbers_list = sample(
+        model, tokenizer, rollouts_per_prompt, prompts_per_generation, max_new_tokens, model_type=model_type
     )
 
     # 2. Second pass: Construct revision prompts and revise with the revision_model
@@ -975,13 +935,18 @@ def sample_and_revise(
         # Here, we will just pass a placeholder since the prompt is about revision.
         # A more advanced implementation could use the reward to guide revision.
                 
+        if model_type == ModelType.THINKING:
+            start_tag, end_tag = "<think>", "</think>"
+        else:
+            start_tag, end_tag = "<reasoning>", "</reasoning>"
+
         revision_prompt = f"""The following is a solution to a math problem.
 Problem and solution:
 "{full_sequence_text}"
 
-Your task is to revise the chain-of-thought (content in <think> tags) to be more concise and possibly change/complete the final answer. Keep all tokens in the chain-of-thought that are helpful to achieving the correct answer. Eliminate dead ends.
+Your task is to revise the chain-of-thought (content in {start_tag} tags) to be more concise and possibly change/complete the final answer. Keep all tokens in the chain-of-thought that are helpful to achieving the correct answer. Eliminate dead ends.
 
-The revised completion should be in the format: <think>chain-of-thought</think> answer.
+The revised completion should be in the format: {start_tag}chain-of-thought{end_tag} answer.
 """
         revision_prompts.append(revision_prompt)
     
@@ -993,6 +958,7 @@ The revised completion should be in the format: <think>chain-of-thought</think> 
         max_new_tokens,
         disable_adapter=disable_adapter,
         enable_thinking=enable_thinking,
+        model_type=ModelType.THINKING,
     )
 
     # Use revised final answers only if thinking mode is enabled, otherwise use original completions
@@ -1003,16 +969,16 @@ The revised completion should be in the format: <think>chain-of-thought</think> 
         final_completions = revised_completions
     
     # Create the batch from prompts and generated completions
-    rewards = torch.tensor(math_reward_func(final_completions, prompts), dtype=torch.float32)
+    rewards = torch.tensor(math_reward_func(final_completions, prompts, numbers_list, model_type=model_type), dtype=torch.float32)
     advantages = compute_sequence_advantages(rewards, prompts_per_generation, rollouts_per_prompt)
     input_ids = revised_generated_ids
 
     # The loss mask is now directly returned from generate_and_decode
     
-    return input_ids, rewards, advantages, loss_mask, prompts, final_completions
+    return input_ids, rewards, advantages, loss_mask, prompts, final_completions, numbers_list
 
 
-def sample(model, tokenizer, rollouts_per_prompt: int = 4, prompts_per_generation: int = 1, max_new_tokens: int = 512):
+def sample(model, tokenizer, rollouts_per_prompt: int = 4, prompts_per_generation: int = 1, max_new_tokens: int = 512, model_type: ModelType = ModelType.THINKING):
     """Generate a batch of math problems and model completions for GRPO training.
 
     This function first generates a set of unique math problems, then duplicates them
@@ -1035,7 +1001,7 @@ def sample(model, tokenizer, rollouts_per_prompt: int = 4, prompts_per_generatio
 
     Returns
     -------
-    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str], List[str]]
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str], List[str], List[List[int]]]
         A tuple containing:
         - input_ids (torch.Tensor): The full token sequences (prompt + completion),
           padded to the same length.
@@ -1049,10 +1015,11 @@ def sample(model, tokenizer, rollouts_per_prompt: int = 4, prompts_per_generatio
           Shape: `(prompts_per_generation * rollouts_per_prompt, padded_sequence_length - 1)`
         - prompts (List[str]): The list of prompts used for generation.
         - completions (List[str]): The list of decoded model completions.
+        - numbers_list (List[List[int]]): The list of numbers for each prompt.
     """
     
     # Generate `prompts_per_generation` unique math problems
-    problem_generator = generate_math_problems(tokenizer, prompts_per_generation)
+    problem_generator = generate_math_problems(tokenizer, prompts_per_generation, model_type=model_type)
     unique_problems = list(problem_generator)
     
     # Duplicate each problem `rollouts_per_prompt` times
@@ -1060,85 +1027,21 @@ def sample(model, tokenizer, rollouts_per_prompt: int = 4, prompts_per_generatio
     
     # Extract prompts
     prompts = [problem["prompt"] for problem in problems]
+    numbers_list = [problem["numbers"] for problem in problems]
 
     # Generate completions using the model
-    completions, generated_ids, loss_mask = generate_and_decode(model, tokenizer, prompts, max_new_tokens, enable_thinking=True)
+    enable_thinking_flag = model_type == ModelType.THINKING
+    completions, generated_ids, loss_mask = generate_and_decode(model, tokenizer, prompts, max_new_tokens, enable_thinking=enable_thinking_flag, model_type=model_type)
     
     # Create the batch from prompts and generated completions
-    rewards = torch.tensor(math_reward_func(completions, prompts), dtype=torch.float32)
+    rewards = torch.tensor(math_reward_func(completions, prompts, numbers_list, model_type=model_type), dtype=torch.float32)
     advantages = compute_sequence_advantages(rewards, prompts_per_generation, rollouts_per_prompt)
     input_ids = generated_ids
 
     # test_sample(input_ids, rewards, advantages, loss_mask, prompts, completions, rollouts_per_prompt, prompts_per_generation)
     # debug_batch_and_actions(tokenizer, input_ids, loss_mask, context="Data Sampling")
 
-    return input_ids, rewards, advantages, loss_mask, prompts, completions
-
-
-def evaluate_model(model, tokenizer, eval_dataset, max_new_tokens=512, batch_size=12):
-    """Batched evaluation that uses the same chat templating and generation path as training."""
-
-    model.eval()
-    total_reward = 0.0
-    total_samples = 0
-    success_count = 0
-    total_response_length = 0.0
-    all_rewards = []
-
-    # Convert dataset to list if it's not already
-    eval_samples = list(eval_dataset)
-
-    # Process evaluation dataset in batches
-    for i in range(0, len(eval_samples), batch_size):
-        batch_samples = eval_samples[i:i + batch_size]
-        batch_prompts = [sample["query"] for sample in batch_samples]
-
-        # Use the unified generation path (with chat template) for consistency
-        completions, generated_ids, _ = generate_and_decode(
-            model,
-            tokenizer,
-            batch_prompts,
-            max_new_tokens,
-            enable_thinking=True,
-        )
-
-        # Re-tokenize prompts to get prompt lengths for response length calculation
-        tokenized_input = tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True)
-        prompt_lengths = (tokenized_input.input_ids != PAD_TOKEN_ID).sum(dim=1)
-        batch_response_lengths = []
-        for row_idx in range(generated_ids.size(0)):
-            prompt_len = prompt_lengths[row_idx].item()
-            response_ids = generated_ids[row_idx, prompt_len:]
-            response_len = (response_ids != PAD_TOKEN_ID).sum().item()
-            batch_response_lengths.append(response_len)
-
-        # Calculate rewards for the batch
-        batch_rewards = math_reward_func(completions, batch_prompts)
-        all_rewards.extend(batch_rewards)
-
-        # Accumulate statistics
-        total_response_length += float(sum(batch_response_lengths))
-        for reward in batch_rewards:
-            total_reward += reward
-            total_samples += 1
-            if reward > 0:
-                success_count += 1
-
-    # Calculate metrics
-    avg_reward = total_reward / total_samples if total_samples > 0 else 0.0
-    reward_std = (
-        torch.tensor(all_rewards, dtype=torch.float32).std().item() if total_samples > 0 else 0.0
-    )
-    success_rate = success_count / total_samples if total_samples > 0 else 0.0
-    avg_response_length = total_response_length / total_samples if total_samples > 0 else 0.0
-
-    return {
-        "eval_reward_mean": avg_reward,
-        "eval_reward_std": reward_std,
-        "eval_success_rate": success_rate,
-        "eval_avg_response_length": avg_response_length,
-        "eval_samples": total_samples,
-    }
+    return input_ids, rewards, advantages, loss_mask, prompts, completions, numbers_list
 
 
 # ---------------------------------------------------------------------------
@@ -1188,13 +1091,13 @@ def main():
     parser.add_argument("--use_wandb", action="store_true", default=True, help="Use Weights & Biases for logging")
     parser.add_argument("--wandb_project", type=str, default="grpo-math-training", help="W&B project name")
     parser.add_argument("--wandb_run_name", type=str, default="custom-grpo", help="W&B run name")
-    parser.add_argument("--eval_size", type=int, default=10, help="Number of problems for evaluation")
         
     # KL threshold configuration
     parser.add_argument("--kl_threshold", type=float, default=10, help="KL divergence threshold for early stopping")
     
     # Revision configuration
     parser.add_argument("--use_revision", action="store_true", default=False, help="Use revision model to revise completions during sampling.")
+    parser.add_argument("--model_type", type=ModelType, default=ModelType.THINKING, choices=list(ModelType), help="Type of model training.")
     
     # Learning rate scheduler configuration
     parser.add_argument("--lr_schedule", action="store_true", default=True, help="Use linear learning rate decay")
@@ -1259,6 +1162,8 @@ def main():
 
     print(f"Tokenizer pad token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
     print(f"Tokenizer EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
+
+    # print(len(tokenizer("<reasoning>")["input_ids"]))
 
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -1366,23 +1271,8 @@ def main():
         else:
             print("Training full model. Consider using --use_lora for better memory efficiency.")
         
-        # Create eval dataset once for reuse
-        print(f"Creating evaluation dataset with {args.eval_size} problems...")
-        
-        # Generate data for evaluation
-        eval_data = []
-        problem_generator = generate_math_problems(tokenizer, args.eval_size)
-        for problem in problem_generator:
-            eval_data.append({
-                "query": problem["prompt"],
-                "target": problem["target"],
-                "numbers": problem["numbers"]
-            })
-        
-        eval_dataset = Dataset.from_list(eval_data)
-        
         # Run training using the new train method
-        training_results = trainer.train(
+        trainer.train(
             tokenizer=tokenizer,
             collection_steps=collection_steps,
             batch_size=args.batch_size,
@@ -1391,13 +1281,13 @@ def main():
             prompts_per_generation=args.prompts_per_generation,
             max_new_tokens=args.max_new_tokens,
             prompts_per_compute_loss=args.prompts_per_compute_loss,
-            eval_dataset=eval_dataset,
             use_wandb=args.use_wandb,
             kl_threshold=args.kl_threshold,
             use_revision=args.use_revision,
             minibatch_size=args.minibatch_size,
             save_steps=args.save_steps,
             repo_id=repo_id if args.use_lora else None,
+            model_type=args.model_type,
         )
 
         print("Training complete!")

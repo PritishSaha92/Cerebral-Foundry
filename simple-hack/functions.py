@@ -2,22 +2,33 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import Dataset
 import random
 import re
+from typing import List, Dict, Any, Optional
 
-LOG_FREQUENCY = 0.02 # Print logs every 50 calls on average
+from enums import ModelType
 
-def parse_completion(completion: str) -> tuple[str, str]:
+LOG_FREQUENCY = 1 # Print logs every 50 calls on average
+
+# Set a seed for reproducibility
+random.seed(42)
+
+def parse_completion(completion: str, model_type: ModelType) -> tuple[str, str]:
     """
-    Parses a completion string that may contain <think>...</think> blocks.
-    Extracts thinking content and the final answer.
+    Parses a completion string that may contain <think>...</think> or <reasoning>...</reasoning> blocks.
+    Extracts thinking/reasoning content and the final answer.
     
     Args:
         completion (str): The model's completion string.
+        model_type (ModelType): The type of model, which determines the tags to use.
         
     Returns:
         tuple[str, str]: A tuple of (thinking_content, final_content).
     """
-    end_tag = '</think>'
-    start_tag = '<think>'
+    if model_type == ModelType.THINKING:
+        start_tag = '<think>'
+        end_tag = '</think>'
+    else:
+        start_tag = '<reasoning>'
+        end_tag = '</reasoning>'
     
     end_tag_pos = completion.rfind(end_tag)
     
@@ -25,20 +36,18 @@ def parse_completion(completion: str) -> tuple[str, str]:
         content = completion[end_tag_pos + len(end_tag):].strip()
         
         # Extract thinking content
-        # The thinking content is between <think> and </think>
-        # We look for the last <think> before the last </think>
         think_part = completion[:end_tag_pos]
         start_tag_pos = think_part.rfind(start_tag)
         
         if start_tag_pos != -1:
             thinking_content = think_part[start_tag_pos + len(start_tag):].strip()
         else:
-            # Fallback if no start tag is found before the end tag
-            thinking_content = ""
+            # If no start tag is found, assume everything before the end tag is thinking.
+            thinking_content = think_part.strip()
         
         return thinking_content, content
     
-    # No </think> tag found
+    # No end tag found
     return "", ""
 
 def is_correct(content, target):
@@ -155,102 +164,100 @@ def generate_problem(target, num_count=4, num_range=10):
     print(f"Warning: Could not generate valid problem for target {target} after {max_attempts} attempts")
     return None, None
 
-def test_generate():
-    # Test the generate_problem function
-    print("\n" + "="*50)
-    print("Testing generate_problem function:")
-    print("="*50)
-
-    # Test with different targets
-    targets = [24, 24, 24, 24]
-
-    for target in targets:
-        print(f"\nTarget: {target}")
-        
-        # Generate 3 examples for each target using the improved function
-        for i in range(3):
-            numbers, expression = generate_problem(target, num_count=4, num_range=10)
-            
-            print(f"  Attempt {i+1}:")
-            if numbers and expression:
-                print(f"    Numbers: {numbers}")
-                print(f"    ✓ Expression: {expression} = {target}")
-                print(f"    ✓ Is correct: {is_correct(expression, target)}")
-            else:
-                print(f"    ✗ Could not find valid expression after 100 attempts")
-                
-        print("-" * 30)
-
-def test_inference(model_name):
-    # load the tokenizer and the model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype="auto",
-        device_map="auto"
-    )
-
-    # prepare the model input
-    prompt = "Using the numbers 10, 5, 4, 4 exactly once in mathematical notation using addition, subtraction, multiplication, division, and parentheses, create an expression that equals 24. Answer exactly in plain mathematical notation (DO NOT USE LATEX), WITH NO ADDITIONAL TEXT. For example, if the provided numbers are 3, 3, 2, 8, a valid answer would be: (3 / 3 + 2) * 8."
-    messages = [
-        {"role": "user", "content": prompt}
-    ]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=True # Switches between thinking and non-thinking modes. Default is True.
-    )
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-
-    print("starting inference...")
-
-    # conduct text completion
-    generated_ids = model.generate(
-        **model_inputs,
-        max_new_tokens=32768,
-        temperature=0.7,
-        do_sample=True,
-        repetition_penalty=1.1
-    )
-    output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist() 
-
-    # parsing thinking content
-    completion = tokenizer.decode(output_ids, skip_special_tokens=True)
-    thinking_content, content = parse_completion(completion)
-
-    print("thinking content:", thinking_content)
-    print("content:", content)
-
-    # Check if the generated expression is correct
-    result_is_correct = is_correct(content, 24)
-    print(f"Is the answer correct? {result_is_correct}")
-
-def generate_math_problems(tokenizer, dataset_size):
+def generate_math_problems(tokenizer, dataset_size, model_type: ModelType):
     """
     Generator function that creates math problems using generate_problem.
     Yields dictionary with 'prompt' containing the problem description, formatted with thinking template.
     """
-    targets = [24]  # Various target numbers
+    targets = [16]  # Various target numbers
     
     for _ in range(dataset_size):
         target = random.choice(targets)
-        numbers, expression = generate_problem(target, num_count=4, num_range=10)
+        num_count = random.choice([2, 3, 4])
+        numbers, expression = generate_problem(target, num_count=num_count, num_range=10)
         
         if numbers and expression:  # Only yield if we successfully generated a problem
             # Create prompt similar to test_inference
             numbers_str = ", ".join(map(str, numbers))
-            prompt_content = f"Using the numbers {numbers_str} exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Keep your reasoning in the <think> block brief. Answer exactly in plain mathematical notation (DO NOT USE LATEX), WITH NO ADDITIONAL TEXT. For example, if the provided numbers are 8, 3, 2, 3, a valid answer would be: (3 / 3 + 2) * 8. Or, if the numbers were 8, 2, 9, 9, a valid answer would be 9 + 9 - 2 + 8. ANSWER AS SOON AS A CORRECT EXPRESSION IS FOUND. Do not include = {target} in your answer."
-            
-            # messages = [{"role": "user", "content": prompt_content}]
-            
-            # # Apply chat template with thinking mode enabled
-            # prompt = tokenizer.apply_chat_template(
-            #     messages,
-            #     tokenize=False,
-            #     add_generation_prompt=True,
-            #     enable_thinking=True
-            # )
+
+            if model_type == ModelType.BASE:
+                # # R1-ZERO PROMPT:
+                # prompt_content = (
+                #     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. "
+                #     "The assistant first thinks about the reasoning process in the <think></think> tags and then provides the user with the answer.\n"
+                #     f"User: Using the numbers {numbers_str} exactly once in mathematical notation using addition, "
+                #     f"subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}."
+                #     "Show your work in <think> </think> tags. Output your answer after closing the </think> tag WITH NO ADDITIONAL TEXT.For example, if the provided numbers are 8, 3, 2, 3, a valid response would be Assistant: <think> Let me solve this step by step. Hm, maybe I can use 3 / 3 + 2 to get 3. Then I can multiply that by 8 to get 24. </think>(3 / 3 + 2) * 8.\n"
+                #     "Assistant: <think> Let me solve this step by step. "
+                # )
+
+
+
+                # prompt_content = (
+                #     f"SYSTEM: Using the numbers 8, 3, 2, 3, exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your"
+                #     "work in the <think> </think> tags. Answer exactly in plain mathematical notation, WITH NO ADDITIONAL TEXT. \n\n"
+                #     "ASSISTANT: <think> Let me solve this step by step. \n\nHm, maybe I can use 3 / 3 + 2 to get 3. Then I can multiply that by 8 to get 24. </think>(3 / 3 + 2) * 8.\n\n"
+                #     f"SYSTEM: Using the numbers 4, 1, 8, 8, exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your"
+                #     "work in the <think> </think> tags. Answer exactly in plain mathematical notation, WITH NO ADDITIONAL TEXT. \n\n"
+                #     "ASSISTANT: <think> Let me solve this step by step. \n\nOkay, let's see. I need to use the numbers 4, 1, 8, 8 exactly once each with basic operations to make 24. 8 * 4 = 32. Then 32 minus something. If I can get 8 from 1 and 8. Wait, 8 - (8/ something). Wait, 8 - (8/ something). But I already used one 8 in 8*4. So maybe 8*4 - (8 - 1) = 32 -7=25. Close, but no. How about 8*4 - (8/(1))? That's 32 -8=24. Wait! Let me check. 8 multiplied by 4 is 32. Then 8 divided by 1 is 8. So 32 -8=24. And we've used 8, 4, 8, and 1. Exactly once each. So that works! </think>8 * 4 - 8 / 1\n"
+                #     f"SYSTEM: Using the numbers 3, 9, 6, 2, exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your"
+                #     "work in the <think> </think> tags. Answer exactly in plain mathematical notation, WITH NO ADDITIONAL TEXT. \n\n"
+                #     "ASSISTANT: <think> Let me solve this step by step. \n\n6 * 4 = 24. How to get 4 from 3, 9, 2? 9 - 3 - 2 = 4. Yes! So 6 * (9 - 3 - 2) = 6 * 4 = 24. Let me check: 9-3=6, 6-2=4. Then 6*4=24. And we've used 6, 9, 3, 2. All four numbers exactly once. Perfect! </think>6*(9-3-2)\n"
+                #     f"SYSTEM: Using the numbers {numbers_str} exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your"
+                #     "work in the <think> </think> tags. Answer exactly in plain mathematical notation, WITH NO ADDITIONAL TEXT. \n\n"
+                #     "ASSISTANT: <think> Let me solve this step by step. \n\n"
+                # )
+
+
+
+                prompt_content = (
+                    f"Q: Using the numbers 2, 8, 10 exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your "
+                    "work in the <reasoning> </reasoning> tags. \n\n"
+                    "A: <reasoning> Let me solve this step by step. Hm, 10+8=18. and 18-2=16. That's it!</think>10+8-2\n\n"
+                    f"Q: Using the numbers 10, 6 exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your "
+                    "work in the <reasoning> </reasoning> tags. \n\n"
+                    "A: <reasoning> Let me solve this step by step. Hm, 10+6 = 16.</think>10+6\n\n"
+                    f"Q: Using the numbers 4, 3, 4 exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your "
+                    "work in the <reasoning> </reasoning> tags. \n\n"
+                    "A: <reasoning> Let me solve this step by step. Hm, 4*3 = 12. And 12+4=16.</think>4*3+4\n\n"
+                    f"Q: Using the numbers 9, 2, 5, 3 exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your "
+                    "work in the <reasoning> </reasoning> tags. \n\n"
+                    "A: <reasoning> Let me solve this step by step. Hm, 5*2 = 10. And 9-3=6.</think>5*2+9-3\n\n"
+                    f"Q: Using the numbers {numbers_str} exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your "
+                    "work in the <reasoning> </reasoning> tags. \n\n"
+                    "A: "
+                )
+
+                # prompt_content = (
+                #     f"1, 2, 3, 4, 5, 6, "
+                # )
+
+            elif model_type == ModelType.INSTRUCT:
+                # INSTRUCT-TUNED PROMPT (no thinking):
+                prompt_content = f"Using the numbers {numbers_str} exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Show your work in the <think></think> tags. Answer exactly in plain mathematical notation, WITH NO ADDITIONAL TEXT. For example, if the provided numbers are 2, 8, 10, a valid answer would be: <think> Let me solve this step by step. Hm, 10+8=18. and 18-2=16. That's it!</think>10+8-2\n\n Or, if the numbers were 10, 6 a valid answer would be  <think> Let me solve this step by step. Hm, 10+6 = 16.</think>10+6\n\n Do not include = {target} in your answer."
+
+                # prompt_content = (
+                #     f"Your task is to use the numbers {numbers_str} exactly once to create a mathematical expression that equals {target}.\n\n"
+                #     "**Allowed operations:** addition, subtraction, multiplication, division, parentheses.\n\n"
+                #     "**Output format:**\n"
+                #     "1. START WITH `<think>` tags. Inside, show your step-by-step reasoning.\n"
+                #     "2. After the closing `</think>` tag, provide ONLY the final mathematical expression.\n\n"
+                #     "**Crucial Rules:**\n"
+                #     "- DO NOT include any other text, explanation, or the `= 16` part in your final answer.\n"
+                #     "- DO NOT START YOUR RESPONSE WITH `<tool_call>`, `</tool_call>`, OR ANY OTHER TAG BESIDES `<think>`.\n"
+                #     "- DO NOT use any numbers not listed in the provided set.\n\n"
+                #     "**Example 1:**\n"
+                #     "Numbers: 2, 8, 10\n"
+                #     "<think>Let me solve this step by step. Hm, 10+8=18. and 18-2=16. That's it!</think>10+8-2\n\n"
+                #     "**Example 2:**\n"
+                #     "Numbers: 10, 6\n"
+                #     "<think>Let me solve this step by step. Hm, 10+6 = 16.</think>10+6\n\n"
+                #     f"**Your numbers:** {numbers_str}"
+                # )
+
+            else: # Catches ModelType.THINKING
+                # REASONING-TRAINED PROMPT:
+                prompt_content = f"Using the numbers {numbers_str} exactly once in mathematical notation using addition, subtraction, multiplication, division, and/or parentheses, create an expression that equals {target}. Keep your reasoning in the <think> block brief. Answer exactly in plain mathematical notation (DO NOT USE LATEX), WITH NO ADDITIONAL TEXT. For example, if the provided numbers are 8, 3, 2, 3, a valid answer would be: (3 / 3 + 2) * 8. Or, if the numbers were 8, 2, 9, 9, a valid answer would be 9 + 9 - 2 + 8. ANSWER AS SOON AS A CORRECT EXPRESSION IS FOUND. Do not include = {target} in your answer."
             
             yield {
                 "prompt": prompt_content,
@@ -278,27 +285,6 @@ def extract_numbers_from_expression(expression):
     # Convert to integers (assuming we're working with integers based on the problem setup)
     return [int(float(num)) for num in numbers]
 
-def extract_numbers_from_prompt(prompt):
-    """
-    Extracts the list of numbers from the prompt.
-    
-    Args:
-        prompt (str): The prompt containing the numbers
-        
-    Returns:
-        list: List of numbers specified in the prompt
-    """
-    # Look for pattern "Using the numbers X, Y, Z, ..." in the prompt
-    match = re.search(r'Using the numbers ([\d,\s]+)', prompt)
-    
-    if match:
-        numbers_str = match.group(1)
-        # Split by comma and convert to integers
-        numbers = [int(num.strip()) for num in numbers_str.split(',')]
-        return numbers
-    
-    return []
-
 def numbers_match(prompt_numbers, expression_numbers):
     """
     Checks if the numbers used in the expression exactly match those specified in the prompt.
@@ -313,13 +299,14 @@ def numbers_match(prompt_numbers, expression_numbers):
     # Sort both lists and compare
     return sorted(prompt_numbers) == sorted(expression_numbers)
 
-def math_reward_func(completions, prompts, **kwargs):
+def math_reward_func(completions, prompts, numbers_list, model_type: ModelType, **kwargs):
     """
     Reward function that evaluates mathematical correctness using is_correct.
     
     Args:
         completions: List of generated completions
         prompts: List of prompts (to extract target values)
+        numbers_list: List of lists of numbers used in prompts
         **kwargs: Additional arguments
         
     Returns:
@@ -327,21 +314,20 @@ def math_reward_func(completions, prompts, **kwargs):
     """
     rewards = []
     
-    for completion, prompt in zip(completions, prompts):
+    for completion, prompt, prompt_numbers in zip(completions, prompts, numbers_list):
         # Extract target from prompt
         # Look for "equals X" pattern in the prompt
         target_match = re.search(r'equals (\d+)', prompt)
         
         # Clean the completion and check if it's correct
-        _, content = parse_completion(completion)
+        _, content = parse_completion(completion, model_type=model_type)
 
         reward = 0.0  # Default to 0
         
         if target_match:
             target = float(target_match.group(1))
             
-            # Extract numbers from prompt and expression
-            prompt_numbers = extract_numbers_from_prompt(prompt)
+            # Extract numbers from expression
             expression_numbers = extract_numbers_from_expression(content)
             
             # Check both mathematical correctness and number usage
@@ -358,58 +344,33 @@ def math_reward_func(completions, prompts, **kwargs):
             else:
                 reward = 0.0  # Both wrong
         
-        # Penalize completions that are clearly unfinished (unclosed <think> tag)
-        if '<think>' in completion and '</think>' not in completion:
-            reward = 0.0
+        # If the answer isn't perfect, give partial credit for using thinking tags
+        if reward < 1.0:
+            partial_reward = 0.0
+            if model_type == ModelType.THINKING:
+                start_tag, end_tag = "<think>", "</think>"
+            else:
+                start_tag, end_tag = "<reasoning>", "</reasoning>"
+
+            if start_tag in completion:
+                partial_reward += 0.1
+            if end_tag in completion:
+                partial_reward += 0.1
+            # if f"16" in completion:
+            #     partial_reward += 0.05
+            reward = partial_reward
             
         if random.random() < LOG_FREQUENCY:
             print("\n-----")
             print(f"Prompt: {prompt}")
             print(f"Completion: {completion}")
             print(f"Parsed Content: {content}")
-            print(f"Prompt Numbers: {extract_numbers_from_prompt(prompt) if target_match else 'N/A'}")
+            print(f"Prompt Numbers: {prompt_numbers if target_match else 'N/A'}")
             print(f"Expression Numbers: {extract_numbers_from_expression(content) if target_match else 'N/A'}")
-            print(f"Numbers Match: {numbers_match(extract_numbers_from_prompt(prompt), extract_numbers_from_expression(content)) if target_match else 'N/A'}")
+            print(f"Numbers Match: {numbers_match(prompt_numbers, extract_numbers_from_expression(content)) if target_match else 'N/A'}")
             print(f"Reward: {reward}")
             print("-----")
             
         rewards.append(reward)
     
     return rewards
-
-def test_reward():
-    """
-    Test the reward function with some sample completions and prompts
-    """
-    test_completions = [
-        "(4 + 4) * 3",      # Should be incorrect: right math (24) but wrong numbers (uses 3, 3, 4, 4 but expression has only one 3)
-        "3 * 4 + 3 * 4",    # Should be correct: right math (24) and right numbers (3, 3, 4, 4)
-        "4 + 4 + 3",        # Should be incorrect: wrong math (11) but uses some right numbers
-        "10 * 2 + 4",       # Should be incorrect: right math (24) but wrong numbers (missing one 4, has 10 instead of specified numbers)
-        "10 + 4 + 4 + 5 + 1", # Should be incorrect: right math (24) but wrong numbers (uses 5 numbers instead of 4)
-        "(8 * (4 - 2)) + 8", # Should be correct: right math (24) and right numbers (8, 4, 2, 8)
-        "6 * 4",            # Should be incorrect: right math (24) but completely wrong numbers
-    ]
-    
-    test_prompts = [
-        "Using the numbers 3, 3, 4, 4 exactly once in mathematical notation using addition, subtraction, multiplication, division, and parentheses, create an expression that equals 24.",
-        "Using the numbers 3, 3, 4, 4 exactly once in mathematical notation using addition, subtraction, multiplication, division, and parentheses, create an expression that equals 24.", 
-        "Using the numbers 3, 3, 4, 4 exactly once in mathematical notation using addition, subtraction, multiplication, division, and parentheses, create an expression that equals 24.",
-        "Using the numbers 10, 2, 4, 4 exactly once in mathematical notation using addition, subtraction, multiplication, division, and parentheses, create an expression that equals 24.",
-        "Using the numbers 10, 4, 4, 5 exactly once in mathematical notation using addition, subtraction, multiplication, division, and parentheses, create an expression that equals 24.",
-        "Using the numbers 8, 4, 2, 8 exactly once in mathematical notation using addition, subtraction, multiplication, division, and parentheses, create an expression that equals 24.",
-        "Using the numbers 1, 2, 3, 4 exactly once in mathematical notation using addition, subtraction, multiplication, division, and parentheses, create an expression that equals 24.",
-    ]
-    
-    rewards = math_reward_func(test_completions, test_prompts)
-    
-    print("\nTesting reward function:")
-    for i, (completion, prompt, reward) in enumerate(zip(test_completions, test_prompts, rewards)):
-        print(f"\nTest {i+1}:")
-        print(f"  Completion: {completion}")
-        print(f"  Reward: {reward}")
-
-
-if __name__ == "__main__":
-    test_reward()
-
