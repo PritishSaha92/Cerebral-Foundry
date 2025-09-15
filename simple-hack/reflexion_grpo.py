@@ -7,6 +7,10 @@ import time
 from typing import List, Dict, Any, Optional, Tuple
 import copy
 from enum import Enum
+import numpy as np
+
+# Force numpy to print full arrays
+np.set_printoptions(threshold=sys.maxsize)
 
 import torch
 from torch.nn import functional as F
@@ -176,13 +180,13 @@ class GRPOTrainer:
 
     def _kl_loss(
         self,
-        new_logp: torch.Tensor,
-        ref_logp: torch.Tensor,
+        p_logp: torch.Tensor,
+        q_logp: torch.Tensor,
     ) -> torch.Tensor:
-        """Computes the KL divergence loss against the reference model."""
-        log_ratio_ref = ref_logp - new_logp
-        ratio_ref = torch.exp(log_ratio_ref)
-        kl_losses = ratio_ref - log_ratio_ref - 1
+        """Computes the KL divergence loss of q compared to p."""
+        log_ratio = q_logp - p_logp
+        ratio = torch.exp(log_ratio)
+        kl_losses = ratio - 1 - log_ratio
         return kl_losses.sum()
 
     def _combine_experiences(self, experiences: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -256,6 +260,7 @@ class GRPOTrainer:
         advantages_per_sequence: torch.Tensor,
         rollouts_per_prompt: int,
         is_first_step: bool = False,
+        tokenizer: Any = None,
     ) -> Dict[str, Any]:
         """Compute the loss for a batch, but do not perform an optimization step.
         This is used for gradient accumulation.
@@ -305,6 +310,29 @@ class GRPOTrainer:
         # New log-probabilities for gradient flow
         new_logp_full = self._compute_log_probs(self.model, input_ids)
         new_logp = new_logp_full[loss_mask] # Apply mask
+        
+        # # Debug: Print new_logp and corresponding tokens
+        # print(f"\nDebug - new_logp shape: {new_logp.shape}")
+        # print(f"Debug - new_logp values: {new_logp}")
+        
+        # # Get the tokens that correspond to new_logp (the predicted tokens)
+        # predicted_tokens = input_ids[:, 1:][loss_mask]  # These are the target tokens being predicted
+        # print(f"Debug - predicted tokens shape: {predicted_tokens.shape}")
+        # # print(f"Debug - predicted token ids: {predicted_tokens}")
+        
+        # # Keep predicted_tokens as tensor and print with tensor functions
+        # # print(f"Debug - predicted tokens (tensor): {predicted_tokens}")
+        
+        # # Also decode the tokens to English for context
+        # if tokenizer is not None:
+        #     # Decode the entire sequence of tokens at once for an accurate representation
+        #     # This avoids issues with decoding incomplete multi-token characters
+        #     readable_output = tokenizer.decode(predicted_tokens, skip_special_tokens=True, errors='replace')
+        #     print("--- Decoded Tokens ---")
+        #     print(readable_output)
+        #     print("----------------------")
+        # else:
+        #     print("Debug - tokenizer not available for decoding")
 
         # Calculate model entropy over the generated tokens for logging
         with torch.no_grad():
@@ -328,7 +356,9 @@ class GRPOTrainer:
         #     print(f"old_logp: {old_logp}")
         #     print(f"new_logp: {new_logp}")
 
-        kl_loss = self._kl_loss(ref_logp, new_logp)
+
+
+        kl_loss = self._kl_loss(new_logp, ref_logp) # We have to use reverse KL or else sample from reference model.
         loss = (pg_loss + self.kl_coef * kl_loss) / SEQUENCE_LENGTH_NORMALIZATION / float(rollouts_per_prompt)
 
         avg_response_length = loss_mask.sum().item() / loss_mask.shape[0]
@@ -405,6 +435,7 @@ class GRPOTrainer:
             self.model.eval()
             micro_step = 0
             while (len(experience_buffer) < batch_size):
+                self._disable_dropout(self.model)
                 # Sample a fresh batch for each accumulation step
                 if use_revision:
                     sample_start_time = time.time()
@@ -544,6 +575,7 @@ class GRPOTrainer:
                             advantages_per_sequence=micro_batch_data['advantages'],
                             rollouts_per_prompt=rollouts_per_prompt,
                             is_first_step=is_first_gradient_step,
+                            tokenizer=tokenizer,
                         )
                         compute_loss_time = time.time() - compute_loss_start_time
                         print(f"    compute_loss took {compute_loss_time:.3f}s")
@@ -564,7 +596,8 @@ class GRPOTrainer:
                         minibatch_entropies.append(metrics['model_entropy'])
                     
                     # Aggregate KL divergence from the minibatch
-                    avg_kl = sum(minibatch_kls) / len(minibatch_kls) if minibatch_kls else 0.0
+                    # We need to normalize by sequence length since we sum over tokens in GRPOTrainer._kl_loss.
+                    avg_kl = sum(minibatch_kls) / len(minibatch_kls) / SEQUENCE_LENGTH_NORMALIZATION if minibatch_kls else 0.0
 
                     # Check KL threshold before optimizer step
                     if avg_kl > kl_threshold:
@@ -860,10 +893,10 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
         "input_ids": tokenized["input_ids"].to(model.device),
         "attention_mask": tokenized["attention_mask"].to(model.device),
         "max_new_tokens": max_new_tokens,
-        "temperature": 0.6,
+        "temperature": 1,
         "do_sample": True,
         "pad_token_id": PAD_TOKEN_ID,
-        "repetition_penalty": 1.1,
+        # "repetition_penalty": 1.1,
     }
     # Update with any additional kwargs
     base_gen_kwargs.update(gen_kwargs)
@@ -1125,7 +1158,7 @@ def main():
     parser.add_argument("--wandb_run_name", type=str, default="custom-grpo", help="W&B run name")
         
     # KL threshold configuration
-    parser.add_argument("--kl_threshold", type=float, default=10, help="KL divergence threshold for early stopping")
+    parser.add_argument("--kl_threshold", type=float, default=1000, help="KL divergence threshold for early stopping")
     
     # Revision configuration
     parser.add_argument("--use_revision", action="store_true", default=False, help="Use revision model to revise completions during sampling.")
