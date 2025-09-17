@@ -20,11 +20,13 @@ from peft import LoraConfig, get_peft_model, PeftModel
 import wandb
 
 from datasets import Dataset
-from enums import ModelType
+from countdown import CountdownDataset
+from dataset import Dataset, ProblemInstance
+from enums import ModelType, DatasetType
 from dataclasses import dataclass
 
 # Import math problem generation and reward functions
-from functions import generate_math_problems, math_reward_func, parse_completion, ProblemInstance
+from functions import parse_completion
 from reflexion_grpo_tests import test_sample, debug_batch_and_actions, test_combined_experience
 
 @dataclass
@@ -39,7 +41,7 @@ class SampleOutput:
 # Global token IDs - initialized in main() after tokenizer is loaded
 PAD_TOKEN_ID = None
 EOS_TOKEN_ID = None
-SEQUENCE_LENGTH_NORMALIZATION = 1000.0
+SEQUENCE_LENGTH_NORMALIZATION = 250
 
 # Helper function for wandb cleanup
 def cleanup_wandb():
@@ -126,12 +128,13 @@ class GRPOTrainer:
             self.grad_clip_norm = float('inf')
             print("Gradient clipping disabled")
 
-    def _compute_log_probs(self, model: torch.nn.Module, input_ids: torch.Tensor, disable_adapter: bool = False) -> torch.Tensor:
+    def _compute_log_probs(self, model: torch.nn.Module, input_ids: torch.Tensor, tokenizer: Any, disable_adapter: bool = False) -> torch.Tensor:
         """Computes log probabilities for a given model and input_ids.
 
         Args:
             model: The model to be used for computation.
             input_ids: The input tensor for the model of shape (batch_size, sequence_length).
+            tokenizer: The tokenizer for decoding tokens.
             disable_adapter: A boolean flag to disable the adapter if it exists.
         
         Returns:
@@ -152,7 +155,33 @@ class GRPOTrainer:
         
         logits = outputs.logits[:, :-1, :]
         log_probs = F.log_softmax(logits, dim=-1)
-        return log_probs.gather(-1, target_actions.unsqueeze(-1)).squeeze(-1)
+        gathered_log_probs = log_probs.gather(-1, target_actions.unsqueeze(-1)).squeeze(-1)
+
+        # # Get top 3 predicted tokens
+        # top_k_log_probs, top_k_indices = torch.topk(log_probs, 3, dim=-1)
+        # top_k_probs = torch.exp(top_k_log_probs)
+
+        # print("--- Probs per Token ---")
+        # for i in range(target_actions.shape[0]):
+        #     print(f"Sample {i}:")
+        #     for j in range(target_actions.shape[1]):
+        #         token_id = target_actions[i, j].item()
+                
+        #         prob = torch.exp(gathered_log_probs[i, j]).item()
+        #         token = tokenizer.decode(token_id)
+                
+        #         top_k_preds = []
+        #         for k in range(3):
+        #             pred_token_id = top_k_indices[i, j, k].item()
+        #             pred_prob = top_k_probs[i, j, k].item()
+        #             pred_token = tokenizer.decode(pred_token_id)
+        #             top_k_preds.append(f"'{pred_token}' ({pred_token_id}): {pred_prob:.4f}")
+                
+        #         top_k_str = ", ".join(top_k_preds)
+        #         print(f"  Actual: '{token}' ({token_id}): {prob:.4f} | Top 3: [{top_k_str}]")
+        # print("---")
+        
+        return gathered_log_probs
 
     def _pg_loss(
         self,
@@ -252,6 +281,21 @@ class GRPOTrainer:
             if isinstance(m, torch.nn.Dropout):
                 m.eval()
 
+    def _calculate_entropy(self, log_probs: torch.Tensor) -> float:
+        """
+        Calculates the mean entropy from a tensor of log probabilities.
+
+        Args:
+            log_probs (torch.Tensor): A tensor of log probabilities.
+
+        Returns:
+            float: The mean entropy.
+        """
+        with torch.no_grad():
+            entropy = -log_probs.detach()
+            mean_entropy = entropy.mean().item()
+        return mean_entropy
+
     def compute_loss(
         self,
         input_ids: torch.Tensor,
@@ -292,6 +336,7 @@ class GRPOTrainer:
             ref_logp_full = self._compute_log_probs(
                 model=self.ref_model,
                 input_ids=input_ids,
+                tokenizer=tokenizer,
                 disable_adapter=True,
             )
             ref_logp = ref_logp_full[loss_mask]
@@ -308,7 +353,7 @@ class GRPOTrainer:
         advantages = torch.repeat_interleave(seq_advantages, token_counts_per_sequence)
         
         # New log-probabilities for gradient flow
-        new_logp_full = self._compute_log_probs(self.model, input_ids)
+        new_logp_full = self._compute_log_probs(self.model, input_ids, tokenizer=tokenizer)
         new_logp = new_logp_full[loss_mask] # Apply mask
         
         # # Debug: Print new_logp and corresponding tokens
@@ -327,7 +372,7 @@ class GRPOTrainer:
         # if tokenizer is not None:
         #     # Decode the entire sequence of tokens at once for an accurate representation
         #     # This avoids issues with decoding incomplete multi-token characters
-        #     readable_output = tokenizer.decode(predicted_tokens, skip_special_tokens=True, errors='replace')
+        #     readable_output = tokenizer.decode(predicted_tokens, skip_special_tokens=False, errors='replace')
         #     print("--- Decoded Tokens ---")
         #     print(readable_output)
         #     print("----------------------")
@@ -335,9 +380,7 @@ class GRPOTrainer:
         #     print("Debug - tokenizer not available for decoding")
 
         # Calculate model entropy over the generated tokens for logging
-        with torch.no_grad():
-            estimated_entropy = -new_logp.detach()
-            mean_entropy = estimated_entropy.mean().item()
+        mean_entropy = self._calculate_entropy(new_logp)
 
         # Compute loss components
         pg_loss, clipped_fraction = self._pg_loss(new_logp, old_logp, advantages)
@@ -375,6 +418,7 @@ class GRPOTrainer:
     def train(
         self,
         tokenizer: Any,
+        dataset: Dataset,
         collection_steps: int,
         batch_size: int,
         epochs_per_batch: int,
@@ -427,6 +471,7 @@ class GRPOTrainer:
             experience_buffer = leftover_experience
             leftover_experience = []
             raw_rewards = []
+            raw_entropy = []
             all_zero_rewards_count = 0
             all_one_rewards_count = 0
             prompts_processed_count = 0
@@ -443,6 +488,7 @@ class GRPOTrainer:
                         model=self.model,
                         tokenizer=tokenizer,
                         revision_model=self.model,
+                        dataset=dataset,
                         rollouts_per_prompt=rollouts_per_prompt,
                         prompts_per_generation=prompts_per_generation,
                         max_new_tokens=max_new_tokens,
@@ -454,7 +500,7 @@ class GRPOTrainer:
                     print(f"  sample_and_revise took {sample_time:.2f}s")
                 else:
                     sample_start_time = time.time()
-                    sample_output = sample(self.model, tokenizer, rollouts_per_prompt=rollouts_per_prompt, prompts_per_generation=prompts_per_generation, max_new_tokens=max_new_tokens, model_type=model_type)
+                    sample_output = sample(self.model, tokenizer, dataset, rollouts_per_prompt=rollouts_per_prompt, prompts_per_generation=prompts_per_generation, max_new_tokens=max_new_tokens, model_type=model_type)
                     sample_outputs = [sample_output]
                     sample_time = time.time() - sample_start_time
                     print(f"  sample took {sample_time:.2f}s")
@@ -479,7 +525,8 @@ class GRPOTrainer:
                         if torch.all(rewards_chunks[i] == 1):
                             all_one_rewards_count += 1
 
-                        if (not torch.all(advantages_chunks[i] == 0)):
+                        # if (not torch.all(advantages_chunks[i] == 0)):
+                        if True:
                             experience_buffer.append({
                                 'input_ids': input_ids_chunks[i].to('cpu'), 
                                 'rewards': rewards_chunks[i].to('cpu'),
@@ -492,7 +539,16 @@ class GRPOTrainer:
                     batch_reward_mean = rewards.mean().item()
                     training_rewards.extend(rewards.tolist())
                     raw_rewards.extend(rewards.tolist())
-                    print(f"  Collected micro-batch {micro_step+1}/projected {batch_size // prompts_per_generation} | reward: {batch_reward_mean:.3f}")
+
+                    # Unfortunately we run out of GPU memory doing this.
+                    # # Calculate raw entropy for this micro-batch
+                    # with torch.no_grad():
+                    #     old_logp_full = self._compute_log_probs(self.model, input_ids, tokenizer=tokenizer)
+                    # masked_logp = old_logp_full[loss_mask]
+                    # batch_entropy = self._calculate_entropy(masked_logp)
+                    # raw_entropy.append(batch_entropy)
+
+                    print(f"  Collected micro-batch {micro_step+1}/projected {batch_size // prompts_per_generation} | reward: {batch_reward_mean:.3f}")# | entropy: {batch_entropy:.3f}")
                     micro_step += 1
 
             leftover_experience = experience_buffer[batch_size:]
@@ -507,7 +563,7 @@ class GRPOTrainer:
                 combined_experience = self._combine_experiences(sublist)
                 
                 with torch.no_grad():
-                    old_logp_full = self._compute_log_probs(self.model, combined_experience['input_ids'])
+                    old_logp_full = self._compute_log_probs(self.model, combined_experience['input_ids'], tokenizer=tokenizer)
                     combined_experience['old_logp_full'] = old_logp_full.detach().to('cpu')
 
                 # test_combined_experience(combined_experience, prompts_per_compute_loss, rollouts_per_prompt)
@@ -534,6 +590,7 @@ class GRPOTrainer:
             fraction_all_zero_rewards = (all_zero_rewards_count / prompts_processed_count) if prompts_processed_count > 0 else 0
             fraction_all_one_rewards = (all_one_rewards_count / prompts_processed_count) if prompts_processed_count > 0 else 0
             raw_rewards_mean = torch.tensor(raw_rewards).mean().item() if raw_rewards else 0.0
+            raw_entropy_mean = torch.tensor(raw_entropy).mean().item() if raw_entropy else 0.0
 
             # Each item in processed_buffer corresponds to prompts_per_compute_loss prompts.
             # We calculate a step size to ensure `minibatch_size` correctly refers to the number of prompts.
@@ -684,6 +741,7 @@ class GRPOTrainer:
                             "train/fraction_all_zero_rewards": fraction_all_zero_rewards,
                             "train/fraction_all_one_rewards": fraction_all_one_rewards,
                             "train/raw_rewards_mean": raw_rewards_mean,
+                            "train/raw_entropy_mean": raw_entropy_mean,
                             "collection_step": collection_step,
                             "epoch_per_batch": epoch + 1,
                         }
@@ -703,6 +761,7 @@ class GRPOTrainer:
                         f"lr: {current_lr:.2e} | "
                         f"reward: {avg_reward_mean:.3f} (raw_batch: {raw_batch_reward_mean:.3f}, revised_batch: {revised_batch_reward_mean:.3f}) | "
                         f"raw_rewards_mean: {raw_rewards_mean:.3f} | "
+                        f"raw_entropy_mean: {raw_entropy_mean:.3f} | "
                         f"reward_std: {avg_reward_std:.3f} | "
                         f"unclipped_grad_norm: {unclipped_grad_norm:.4f} | "
                         f"success: {avg_success_rate:.1%} | "
@@ -933,6 +992,7 @@ def sample_and_revise(
     model, 
     tokenizer, 
     revision_model,
+    dataset: Dataset,
     rollouts_per_prompt: int, 
     prompts_per_generation: int,
     max_new_tokens: int, 
@@ -972,7 +1032,7 @@ def sample_and_revise(
     # 1. First pass: Sample from the base model to get initial solutions
     print("First pass: Sampling from the base model to get initial solutions")
     initial_sample = sample(
-        model, tokenizer, rollouts_per_prompt, prompts_per_generation, max_new_tokens, model_type=model_type
+        model, tokenizer, dataset, rollouts_per_prompt, prompts_per_generation, max_new_tokens, model_type=model_type
     )
     initial_rewards = initial_sample.rewards
     problem_instances = initial_sample.problem_instances
@@ -994,11 +1054,9 @@ Reward: {initial_rewards[i]}
 Your task is to revise the solution to output a correct expression in <answer></answer> tags and revise the output leading to the answer to include only and all tokens that are helpful to achieving the correct answer.
 """
         revision_prompts.append(revision_prompt)
-        revision_problem_instances.append(ProblemInstance(
-            prompt=revision_prompt,
-            target=problem_instances[i].target,
-            numbers=problem_instances[i].numbers
-        ))
+        revision_problem_instances.append(
+            ProblemInstance.from_instance(problem_instances[i], new_prompt=revision_prompt)
+        )
     
     print("Second pass: Constructing revision prompts and revising with the revision_model")
     # Generate revised completions
@@ -1020,7 +1078,7 @@ Your task is to revise the solution to output a correct expression in <answer></
         final_completions = revised_completions
     
     # Create the batch from prompts and generated completions
-    rewards = torch.tensor(math_reward_func(final_completions, revision_problem_instances, model_type=model_type), dtype=torch.float32)
+    rewards = torch.tensor(dataset.math_reward_func(final_completions, revision_problem_instances, model_type=model_type), dtype=torch.float32)
     advantages = compute_sequence_advantages(rewards, prompts_per_generation, rollouts_per_prompt)
     input_ids = revised_generated_ids
 
@@ -1037,7 +1095,7 @@ Your task is to revise the solution to output a correct expression in <answer></
     return [initial_sample, revised_sample_output]
 
 
-def sample(model, tokenizer, rollouts_per_prompt: int = 4, prompts_per_generation: int = 1, max_new_tokens: int = 512, model_type: ModelType = ModelType.THINKING) -> SampleOutput:
+def sample(model, tokenizer, dataset: Dataset, rollouts_per_prompt: int = 4, prompts_per_generation: int = 1, max_new_tokens: int = 512, model_type: ModelType = ModelType.THINKING) -> SampleOutput:
     """Generate a batch of math problems and model completions for GRPO training.
 
     This function first generates a set of unique math problems, then duplicates them
@@ -1078,7 +1136,7 @@ def sample(model, tokenizer, rollouts_per_prompt: int = 4, prompts_per_generatio
     """
     
     # Generate `prompts_per_generation` unique math problems
-    problem_generator = generate_math_problems(tokenizer, prompts_per_generation, model_type=model_type)
+    problem_generator = dataset.generate_math_problems(prompts_per_generation, model_type=model_type)
     unique_problems = list(problem_generator)
     
     # Duplicate each problem `rollouts_per_prompt` times
@@ -1092,7 +1150,7 @@ def sample(model, tokenizer, rollouts_per_prompt: int = 4, prompts_per_generatio
     completions, generated_ids, loss_mask = generate_and_decode(model, tokenizer, prompts, max_new_tokens, enable_thinking=enable_thinking_flag, model_type=model_type)
     
     # Create the batch from prompts and generated completions
-    rewards = torch.tensor(math_reward_func(completions, problems, model_type=model_type), dtype=torch.float32)
+    rewards = torch.tensor(dataset.math_reward_func(completions, problems, model_type=model_type), dtype=torch.float32)
     advantages = compute_sequence_advantages(rewards, prompts_per_generation, rollouts_per_prompt)
     input_ids = generated_ids
 
@@ -1156,6 +1214,13 @@ def main():
     parser.add_argument("--use_wandb", action="store_true", default=True, help="Use Weights & Biases for logging")
     parser.add_argument("--wandb_project", type=str, default="grpo-math-training", help="W&B project name")
     parser.add_argument("--wandb_run_name", type=str, default="custom-grpo", help="W&B run name")
+    parser.add_argument(
+        "--dataset",
+        type=DatasetType,
+        default=DatasetType.COUNTDOWN,
+        choices=list(DatasetType),
+        help="The dataset to use for training. Currently, only 'countdown' is supported.",
+    )
         
     # KL threshold configuration
     parser.add_argument("--kl_threshold", type=float, default=1000, help="KL divergence threshold for early stopping")
@@ -1317,6 +1382,11 @@ def main():
     print(f"Total optimization steps: {total_optim_steps}")
     print(f"Data collection steps: {collection_steps} (total_optim_steps / epochs_per_batch)")
 
+    if args.dataset == DatasetType.COUNTDOWN:
+        dataset = CountdownDataset()
+    else:
+        raise ValueError(f"Unsupported dataset type: {args.dataset}")
+
     trainer = GRPOTrainer(
         model,
         ref_model=ref_model,
@@ -1339,6 +1409,7 @@ def main():
         # Run training using the new train method
         trainer.train(
             tokenizer=tokenizer,
+            dataset=dataset,
             collection_steps=collection_steps,
             batch_size=args.batch_size,
             epochs_per_batch=args.epochs_per_batch,
@@ -1356,22 +1427,6 @@ def main():
         )
 
         print("Training complete!")
-        
-        # # Save model (LoRA adapters if using LoRA, full model otherwise)
-        # if args.use_lora:
-        #     print("Saving final LoRA adapters locally...")
-        #     save_directory = f"./lora_adapters_grpo_math-{run_id}"
-        #     model.save_pretrained(save_directory)
-        #     print(f"LoRA adapters saved to {save_directory}")
-
-        #     print(f"Pushing final LoRA adapters to Hugging Face Hub: {repo_id}")
-        #     try:
-        #         model.push_to_hub(repo_id, commit_message="Final model checkpoint")
-        #         print(f"Successfully pushed to main branch of {repo_id}")
-        #     except Exception as e:
-        #         print(f"Failed to push final model to Hub: {e}")
-        # else:
-        #     print("To save full model, use: model.save_pretrained('./saved_model')")
         
     except Exception as e:
         print(f"\nTraining failed with exception: {e}")
