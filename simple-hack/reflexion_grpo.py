@@ -35,6 +35,7 @@ class SampleOutput:
     rewards: torch.Tensor
     advantages: torch.Tensor
     loss_mask: torch.Tensor
+    gen_logp_padded: torch.Tensor
     completions: List[str]
     problem_instances: List[ProblemInstance]
 
@@ -95,6 +96,7 @@ class GRPOTrainer:
         lr_schedule: bool = True,
         min_lr_ratio: float = 0.1,
         grad_clip_norm: Optional[float] = 1.0,
+        truncation_C: float = 8.0,
     ) -> None:
         self.model = model.to(device)
         self.ref_model = ref_model.to(device)
@@ -104,6 +106,7 @@ class GRPOTrainer:
         self.kl_coef = kl_coef
         self.device = device
         self.grad_clip_norm = grad_clip_norm
+        self.truncation_C = truncation_C
         
         # Learning rate scheduler setup
         self.lr_schedule = lr_schedule
@@ -195,24 +198,34 @@ class GRPOTrainer:
         new_logp: torch.Tensor,
         old_logp: torch.Tensor,
         advantages: torch.Tensor,
-    ) -> Tuple[torch.Tensor, float]:
+        gen_logp: Optional[torch.Tensor] = None,
+        truncation_C: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, float, float]:
         """Computes the policy gradient loss component."""
         ratio = torch.exp(new_logp - old_logp)
+        r_sampler_avg = 0.0
+        if gen_logp is not None and truncation_C is not None:
+            with torch.no_grad():
+                r_sampler = torch.exp(old_logp - gen_logp)
+                r_sampler_avg = r_sampler.mean().item()
+                trunc_importance = torch.clamp(r_sampler, max=float(truncation_C))
+        else:
+            trunc_importance = 1.0
         clipped_fraction = 0.0
         if self.clip_ratio > 0:
             clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio)
-            pg_loss1 = -(ratio * advantages)
-            pg_loss2 = -(clipped_ratio * advantages)
+            pg_loss1 = -(ratio * trunc_importance * advantages)
+            pg_loss2 = -(clipped_ratio * trunc_importance * advantages)
             pg_losses = torch.max(pg_loss1, pg_loss2)
             
             # Count clipping statistics
             clipped_mask = (ratio < 1.0 - self.clip_ratio) | (ratio > 1.0 + self.clip_ratio)
             clipped_fraction = clipped_mask.float().mean().item()
             
-            return pg_losses.sum(), clipped_fraction
+            return pg_losses.sum(), clipped_fraction, r_sampler_avg
         else:
-            unclipped_losses = -(ratio * advantages)
-            return unclipped_losses.sum(), clipped_fraction
+            unclipped_losses = -(ratio * trunc_importance * advantages)
+            return unclipped_losses.sum(), clipped_fraction, r_sampler_avg
 
     def _kl_loss(
         self,
@@ -251,10 +264,12 @@ class GRPOTrainer:
         all_rewards = []
         all_advantages = []
         all_is_revision = []
-        all_old_logp_full = []
+        # all_old_logp_full = []
+        all_gen_logp_padded = []
         for exp in experiences:
             input_ids = exp['input_ids']
             loss_mask = exp['loss_mask']
+            gen_logp_padded = exp['gen_logp_padded']
             
             # Amount of padding needed for this experience's tensors
             padding_len = max_len - input_ids.shape[1]
@@ -267,20 +282,24 @@ class GRPOTrainer:
             # The mask is shorter by 1 in the sequence dimension.
             padded_mask = F.pad(loss_mask, (0, padding_len), 'constant', False)
             padded_loss_masks.append(padded_mask)
+            
+            # Keep gen_logp at its original length; no padding here.
+            all_gen_logp_padded.append(gen_logp_padded)
 
             # These tensors do not have a sequence length dimension to pad, so just append
             all_rewards.append(exp['rewards'])
             all_advantages.append(exp['advantages'])
             all_is_revision.append(exp['is_revision'])
-            all_old_logp_full.append(exp['old_logp_full'])
+            # all_old_logp_full.append(exp['old_logp_full'])
         # Concatenate all tensors along the batch dimension (dim=0)
         return {
             'input_ids': torch.cat(padded_input_ids, dim=0),
             'loss_mask': torch.cat(padded_loss_masks, dim=0),
+            'gen_logp_padded': torch.cat(all_gen_logp_padded, dim=0),
             'rewards': torch.cat(all_rewards, dim=0),
             'advantages': torch.cat(all_advantages, dim=0),
             'is_revision': torch.cat(all_is_revision, dim=0),
-            'old_logp_full': torch.cat(all_old_logp_full, dim=0),
+            # 'old_logp_full': torch.cat(all_old_logp_full, dim=0),
         }
 
     def _disable_dropout(self, model):
@@ -309,8 +328,10 @@ class GRPOTrainer:
         input_ids: torch.Tensor,
         loss_mask: torch.Tensor,
         old_logp_full: torch.Tensor,
+        gen_logp_padded: torch.Tensor,
         advantages_per_sequence: torch.Tensor,
         rollouts_per_prompt: int,
+        C: float,
         is_first_step: bool = False,
         tokenizer: Any = None,
     ) -> Dict[str, Any]:
@@ -357,8 +378,13 @@ class GRPOTrainer:
         seq_advantages = advantages_per_sequence.to(self.device)
 
         # For each sequence, repeat its advantage for the number of generated tokens included in the loss
-        token_counts_per_sequence = loss_mask.sum(dim=1)
+        token_counts_per_sequence = loss_mask.sum(dim=1).to(torch.int64)
         advantages = torch.repeat_interleave(seq_advantages, token_counts_per_sequence)
+
+        # Align sampler log-probs (gen_logp) to masked token positions
+        gen_logp_padded = gen_logp_padded.to(self.device)
+        gen_logp_parts = [gen_logp_padded[i, : token_counts_per_sequence[i]] for i in range(gen_logp_padded.shape[0])]
+        gen_logp = torch.cat(gen_logp_parts, dim=0)
         
         # New log-probabilities for gradient flow
         new_logp_full = self._compute_log_probs(self.model, input_ids, tokenizer=tokenizer)
@@ -390,8 +416,8 @@ class GRPOTrainer:
         # Calculate model entropy over the generated tokens for logging
         mean_entropy = self._calculate_entropy(new_logp)
 
-        # Compute loss components
-        pg_loss, clipped_fraction = self._pg_loss(new_logp, old_logp, advantages)
+        # Compute loss components using existing PPO-style helper (with truncation)
+        pg_loss, clipped_fraction, r_sampler_avg = self._pg_loss(new_logp, old_logp, advantages, gen_logp=gen_logp, truncation_C=C)
 
         # # Debug: Check if new_logp equals ref_logp
         # logp_equal = torch.allclose(new_logp, ref_logp, atol=1e-6)
@@ -421,6 +447,7 @@ class GRPOTrainer:
             "clipped_fraction": clipped_fraction,
             "avg_response_length": avg_response_length,
             "model_entropy": mean_entropy,
+            "r_sampler_avg": r_sampler_avg,
         }
 
     def train(
@@ -519,15 +546,16 @@ class GRPOTrainer:
                     advantages = sample_output.advantages
                     loss_mask = sample_output.loss_mask
 
-                    with torch.no_grad():
-                        old_logp_full = self._compute_log_probs(self.model, input_ids, tokenizer=tokenizer)
+                    # with torch.no_grad():
+                    #     old_logp_full = self._compute_log_probs(self.model, input_ids, tokenizer=tokenizer)
 
                     # Split tensors
                     input_ids_chunks = torch.split(input_ids, rollouts_per_prompt)
                     rewards_chunks = torch.split(rewards, rollouts_per_prompt)
                     advantages_chunks = torch.split(advantages, rollouts_per_prompt)
                     loss_mask_chunks = torch.split(loss_mask, rollouts_per_prompt)
-                    old_logp_full_chunks = torch.split(old_logp_full, rollouts_per_prompt)
+                    gen_logp_padded_chunks = torch.split(sample_output.gen_logp_padded, rollouts_per_prompt)
+                    # old_logp_full_chunks = torch.split(old_logp_full, rollouts_per_prompt)
 
                     for i in range(prompts_per_generation):
                         # Track reward statistics per-prompt
@@ -544,8 +572,9 @@ class GRPOTrainer:
                                 'rewards': rewards_chunks[i].to('cpu'),
                                 'advantages': advantages_chunks[i].to('cpu'),
                                 'loss_mask': loss_mask_chunks[i].to('cpu'),
+                                'gen_logp_padded': gen_logp_padded_chunks[i].to('cpu'),
                                 'is_revision': torch.tensor([sample_idx > 0] * rollouts_per_prompt, dtype=torch.bool),
-                                'old_logp_full': old_logp_full_chunks[i].to('cpu'),
+                                # 'old_logp_full': old_logp_full_chunks[i].to('cpu'),
                             })
                     
                     # Track and log rewards from this collection micro-batch
@@ -575,9 +604,9 @@ class GRPOTrainer:
                 sublist = experience_buffer[i:i+prompts_per_compute_loss]
                 combined_experience = self._combine_experiences(sublist)
                 
-                # with torch.no_grad():
-                #     old_logp_full = self._compute_log_probs(self.model, combined_experience['input_ids'], tokenizer=tokenizer)
-                #     combined_experience['old_logp_full'] = old_logp_full.detach().to('cpu')
+                with torch.no_grad():
+                    old_logp_full = self._compute_log_probs(self.model, combined_experience['input_ids'], tokenizer=tokenizer)
+                    combined_experience['old_logp_full'] = old_logp_full.detach().to('cpu')
 
                 # test_combined_experience(combined_experience, prompts_per_compute_loss, rollouts_per_prompt)
                 
@@ -625,6 +654,7 @@ class GRPOTrainer:
                     minibatch_clipped_fractions = []
                     minibatch_response_lengths = []
                     minibatch_entropies = []
+                    minibatch_r_sampler_avgs = []
 
                     # Iterate over the collected experience in the minibatch
                     for micro_batch_data in minibatch:
@@ -642,8 +672,10 @@ class GRPOTrainer:
                             input_ids=micro_batch_data['input_ids'],
                             loss_mask=micro_batch_data['loss_mask'],
                             old_logp_full=micro_batch_data['old_logp_full'],
+                            gen_logp_padded=micro_batch_data['gen_logp_padded'],
                             advantages_per_sequence=micro_batch_data['advantages'],
                             rollouts_per_prompt=rollouts_per_prompt,
+                            C=self.truncation_C,
                             is_first_step=is_first_gradient_step,
                             tokenizer=tokenizer,
                         )
@@ -664,6 +696,7 @@ class GRPOTrainer:
                         minibatch_clipped_fractions.append(metrics['clipped_fraction'])
                         minibatch_response_lengths.append(metrics['avg_response_length'])
                         minibatch_entropies.append(metrics['model_entropy'])
+                        minibatch_r_sampler_avgs.append(metrics['r_sampler_avg'])
                     
                     # Aggregate KL divergence from the minibatch
                     # We need to normalize by sequence length since we sum over tokens in GRPOTrainer._kl_loss.
@@ -718,6 +751,7 @@ class GRPOTrainer:
                     avg_clipped_fraction = sum(minibatch_clipped_fractions) / len(minibatch_clipped_fractions)
                     avg_response_length = sum(minibatch_response_lengths) / len(minibatch_response_lengths)
                     avg_entropy = sum(minibatch_entropies) / len(minibatch_entropies)
+                    avg_r_sampler = sum(minibatch_r_sampler_avgs) / len(minibatch_r_sampler_avgs) if minibatch_r_sampler_avgs else 0.0
                     
                     # Compute reward metrics from the current minibatch
                     minibatch_rewards = torch.cat([data['rewards'] for data in minibatch])
@@ -755,6 +789,7 @@ class GRPOTrainer:
                             "train/fraction_all_one_rewards": fraction_all_one_rewards,
                             "train/raw_rewards_mean": raw_rewards_mean,
                             "train/raw_entropy_mean": raw_entropy_mean,
+                            "train/r_sampler_avg": avg_r_sampler,
                             "collection_step": collection_step,
                             "epoch_per_batch": epoch + 1,
                         }
@@ -780,7 +815,8 @@ class GRPOTrainer:
                         f"success: {avg_success_rate:.1%} | "
                         f"zeros: {all_zero_rewards_count}/{prompts_processed_count} | "
                         f"ones: {all_one_rewards_count}/{prompts_processed_count} | "
-                        f"entropy: {avg_entropy:.4f}"
+                        f"entropy: {avg_entropy:.4f} | "
+                        f"r_sampler: {avg_r_sampler:.4f}"
                     )
                 
                 if kl_exceeded:
@@ -802,7 +838,12 @@ class GRPOTrainer:
 def generate_with_cache(model, **kwargs):
     """
     Temporarily disables gradient checkpointing and enables caching for faster generation.
+    Always returns a tuple of (generated_ids, transition_logprobs) where
+    transition_logprobs are per-token log-probabilities for the generated tokens.
     """
+    # Ensure generation returns scores and a dict so we can compute log-probs
+    kwargs["output_scores"] = True
+    kwargs["return_dict_in_generate"] = True
     # Store original states
     was_gradient_checkpointing = model.is_gradient_checkpointing
     original_use_cache = model.config.use_cache
@@ -814,14 +855,20 @@ def generate_with_cache(model, **kwargs):
 
     # Generate
     with torch.inference_mode():
-        generated_ids = model.generate(**kwargs)
+        output = model.generate(**kwargs)
 
     # Restore original states
     model.config.use_cache = original_use_cache
     if was_gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    return generated_ids
+    # Compute per-token transition log-probabilities for generated tokens
+    # output.scores is a list of length generated_len with tensors (batch*v, vocab)
+    transition_logprobs = model.compute_transition_scores(
+        output.sequences, output.scores, normalize_logits=True
+    )
+
+    return output.sequences, transition_logprobs
 
 
 def _extract_completions_and_create_loss_mask(tokenizer, generated_ids: torch.Tensor, input_ids: torch.Tensor) -> Tuple[List[str], torch.Tensor]:
@@ -837,6 +884,10 @@ def _extract_completions_and_create_loss_mask(tokenizer, generated_ids: torch.Te
     
     # Decode the completion tokens, skipping special tokens.
     completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+
+    completions_with_special_tokens = tokenizer.batch_decode(completion_ids, skip_special_tokens=False)
+    generated_ids_with_special_tokens = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)
+    input_ids_with_special_tokens = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
 
     # Create the loss mask.
     prompt_len = input_ids.shape[1]
@@ -917,15 +968,12 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
 
     Returns
     -------
-    Tuple[List[str], torch.Tensor, torch.Tensor]
-        - completions (List[str]): Decoded completions for each prompt with special
-          tokens removed. Length equals `len(prompts)`.
-        - generated_ids (torch.Tensor): Token IDs for the full sequences
-          (prompt + completion), left-padded to a common length. Shape:
-          `(batch_size, seq_len)`.
-        - loss_mask (torch.Tensor): A boolean mask that is `True` only for the
-          generated (completion) tokens.
-          Shape: `(batch_size, seq_len - 1)`.
+    Tuple[List[str], torch.Tensor, torch.Tensor, torch.Tensor]
+        - completions (List[str])
+        - generated_ids (torch.Tensor)
+        - loss_mask (torch.Tensor)
+        - gen_logp_padded (torch.Tensor): Per-token log-probabilities for generated tokens.
+          Shape: `(batch_size * num_return_sequences, generated_len)`.
     """
     
     if model_type == ModelType.BASE:
@@ -976,9 +1024,9 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
     # Handle adapter disabling for PEFT models
     if disable_adapter and hasattr(model, "disable_adapter"):
         with model.disable_adapter():  # type: ignore[attr-defined]
-            generated_ids = generate_with_cache(model, **base_gen_kwargs)
+            generated_ids, gen_logp_padded = generate_with_cache(model, **base_gen_kwargs)
     else:
-        generated_ids = generate_with_cache(model, **base_gen_kwargs)
+        generated_ids, gen_logp_padded = generate_with_cache(model, **base_gen_kwargs)
 
     # Debug: Check for padding and EOS tokens in generated sequences
     is_pad_tensor = (generated_ids == PAD_TOKEN_ID)
@@ -997,8 +1045,8 @@ def generate_and_decode(model, tokenizer, prompts, max_new_tokens, disable_adapt
     # Extract, decode, and return completions using token-based slicing.
     completions, loss_mask = _extract_completions_and_create_loss_mask(tokenizer, generated_ids, tokenized["input_ids"])
     
-    # Return text completions, full generated sequence, and the loss mask
-    return completions, generated_ids, loss_mask
+    # Return text completions, full generated sequence, the loss mask, and per-token gen log-probs
+    return completions, generated_ids, loss_mask, gen_logp_padded
 
 
 def sample_and_revise(
@@ -1073,7 +1121,7 @@ Your task is to revise the solution to output a correct expression in <answer></
     
     print("Second pass: Constructing revision prompts and revising with the revision_model")
     # Generate revised completions
-    revised_completions, revised_generated_ids, loss_mask = generate_and_decode(
+    revised_completions, revised_generated_ids, loss_mask, gen_logp_padded = generate_and_decode(
         revision_model,
         tokenizer,
         revision_prompts,
@@ -1102,6 +1150,7 @@ Your task is to revise the solution to output a correct expression in <answer></
         rewards=rewards,
         advantages=advantages,
         loss_mask=loss_mask,
+        gen_logp_padded=gen_logp_padded,
         completions=final_completions,
         problem_instances=revision_problem_instances
     )
@@ -1160,7 +1209,7 @@ def sample(model, tokenizer, dataset: Dataset, rollouts_per_prompt: int = 4, pro
 
     # Generate completions using the model
     enable_thinking_flag = model_type == ModelType.THINKING
-    completions, generated_ids, loss_mask = generate_and_decode(model, tokenizer, prompts, max_new_tokens, enable_thinking=enable_thinking_flag, model_type=model_type)
+    completions, generated_ids, loss_mask, gen_logp_padded = generate_and_decode(model, tokenizer, prompts, max_new_tokens, enable_thinking=enable_thinking_flag, model_type=model_type)
     
     # Create the batch from prompts and generated completions
     rewards = torch.tensor(dataset.math_reward_func(completions, problems, model_type=model_type), dtype=torch.float32)
@@ -1175,6 +1224,7 @@ def sample(model, tokenizer, dataset: Dataset, rollouts_per_prompt: int = 4, pro
         rewards=rewards,
         advantages=advantages,
         loss_mask=loss_mask,
+        gen_logp_padded=gen_logp_padded,
         completions=completions,
         problem_instances=problems,
     )
@@ -1202,12 +1252,13 @@ def main():
     )
     parser.add_argument("--lr", type=float, default=1e-6, help="Learning rate")
     parser.add_argument("--steps", type=int, default=32768, help="Total number of optimization steps.")
-    parser.add_argument("--rollouts_per_prompt", type=int, default=4, help="Number of rollouts per prompt.")
-    parser.add_argument("--prompts_per_generation", type=int, default=1, help="Number of unique prompts for each generation step.")
+    parser.add_argument("--rollouts_per_prompt", type=int, default=1, help="Number of rollouts per prompt.")
+    parser.add_argument("--prompts_per_generation", type=int, default=4, help="Number of unique prompts for each generation step.")
     parser.add_argument("--clip_ratio", type=float, default=0.2, help="PPO-style clip ratio")
     parser.add_argument("--kl_coef", type=float, default=0, help="KL penalty coefficient")
+    parser.add_argument("--C", type=float, default=8.0, help="Truncation constant C for importance ratio")
     parser.add_argument("--max_new_tokens", type=int, default=256, help="Maximum new tokens to generate")
-    parser.add_argument("--batch_size", type=int, default=1, help="Number of prompts to sample from for each optimization step.")
+    parser.add_argument("--batch_size", type=int, default=4, help="Number of prompts to sample from for each optimization step.")
     parser.add_argument("--epochs_per_batch", type=int, default=1, help="Number of optimization epochs to run on each collected batch of experience")
     parser.add_argument("--minibatch_size", type=int, default=1, help="Size of minibatches for optimization.")
     parser.add_argument("--prompts_per_compute_loss", type=int, default=1, help="Number of prompts to batch together for a single loss computation.")
@@ -1406,6 +1457,7 @@ def main():
         lr=args.lr,
         clip_ratio=args.clip_ratio,
         kl_coef=args.kl_coef,
+        truncation_C=args.C,
         total_steps=total_optim_steps,
         lr_schedule=args.lr_schedule,
         min_lr_ratio=args.min_lr_ratio,
